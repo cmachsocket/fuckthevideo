@@ -1,0 +1,17 @@
+[versions]
+agp = "8.5.2"
+kotlin = "1.9.24"
+xposedApi = "82"
+
+# Android SDK
+compileSdk = "34"
+minSdk = "26"
+targetSdk = "34"
+
+[libraries]
+# LSPosed / Xposed API stub — runtime 由 LSPosed 框架注入
+xposed-api = { group = "de.robv.android.xposed", name = "api", version.ref = "xposedApi" }
+
+[plugins]
+android-application = { id = "com.android.application", version.ref = "agp" }
+kotlin-android     = { id = "org.jetbrains.kotlin.android", version.ref = "kotlin" }

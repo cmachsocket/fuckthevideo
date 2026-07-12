@@ -1,0 +1,7 @@
+# Copy this to `local.properties` and fill in your SDK path
+# Android Studio 会自动写 .idea/.../local.properties,但建议在这里只保留 SDK 路径
+
+sdk.dir=/opt/android-sdk
+
+# 若使用本地 maven 仓库(可选)
+# maven.repo.local=/home/yourname/.m2/repository

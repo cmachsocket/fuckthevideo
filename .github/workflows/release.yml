@@ -1,0 +1,178 @@
+name: Release
+
+# 触发:推送形如 v* 的 tag(v0.1.0、v1.2.3、v0.2.0-beta1 都算)
+on:
+  push:
+    tags:
+      - 'v*'
+
+# 创建 Release 与上传 assets 必需
+permissions:
+  contents: write
+
+# 避免并发覆盖:同一个 tag 不会被重 push,但手动重跑会排队
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Build & upload APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      # ------------------------------------------------------------
+      # 1. 取代码 (fetch-depth=0 让 git log 能拿到完整历史)
+      # ------------------------------------------------------------
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # ------------------------------------------------------------
+      # 2. JDK 17 — AGP 8.5 硬性要求
+      # ------------------------------------------------------------
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      # ------------------------------------------------------------
+      # 3. Android SDK 平台 34 + Build-Tools 34.0.0
+      # ------------------------------------------------------------
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          api-level: 34
+          build-tools-version: 34.0.0
+
+      # ------------------------------------------------------------
+      # 4. Gradle 8.7 (读 gradle-wrapper.properties)
+      #    此 action 会:
+      #    - 自动装 gradle 8.7
+      #    - 如果仓库里没有 gradlew / gradle-wrapper.jar,自动生成
+      #    - 自带缓存
+      # ------------------------------------------------------------
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.7
+
+      # ------------------------------------------------------------
+      # 5. 从 tag 计算版本号
+      #    ref_name = "v0.1.0" → name = "0.1.0"
+      #    versionCode = epoch 后 7 位(单调递增,够用)
+      # ------------------------------------------------------------
+      - name: Compute version
+        id: version
+        run: |
+          set -euo pipefail
+          TAG="${{ github.ref_name }}"
+          VERSION="${TAG#v}"
+          echo "name=$VERSION" >> "$GITHUB_OUTPUT"
+          CODE=$(( $(date +%s) % 1000000 ))
+          echo "code=$CODE" >> "$GITHUB_OUTPUT"
+          echo "Resolved versionName=$VERSION  versionCode=$CODE"
+
+      # ------------------------------------------------------------
+      # 6. 把版本号写进 app/build.gradle.kts
+      #    这里的 target 是 Kotlin DSL 文件,行尾可能有注释,正则要宽容
+      # ------------------------------------------------------------
+      - name: Inject version into build.gradle.kts
+        run: |
+          set -euo pipefail
+          sed -i -E "s|^([[:space:]]*versionCode[[:space:]]*=[[:space:]]*).*|\1${{ steps.version.outputs.code }}|" app/build.gradle.kts
+          sed -i -E "s|^([[:space:]]*versionName[[:space:]]*=[[:space:]]*)\".*\"|\1\"${{ steps.version.outputs.name }}\"|" app/build.gradle.kts
+          echo "----- patched version line -----"
+          grep -E "[[:space:]]*version(Code|Name)[[:space:]]*=" app/build.gradle.kts
+
+      # ------------------------------------------------------------
+      # 7. local.properties — sdk.dir
+      # ------------------------------------------------------------
+      - name: Write local.properties
+        run: echo "sdk.dir=$ANDROID_SDK_ROOT" > local.properties
+
+      # ------------------------------------------------------------
+      # 8. 真正编译
+      # ------------------------------------------------------------
+      - name: Build release APK
+        run: ./gradlew :app:assembleRelease --stacktrace --warning-mode summary
+
+      # ------------------------------------------------------------
+      # 9. 找到产物
+      # ------------------------------------------------------------
+      - name: Locate APK
+        id: apk
+        run: |
+          set -euo pipefail
+          APK=$(find app/build/outputs/apk/release -maxdepth 1 -name '*.apk' | head -n1)
+          if [ -z "${APK:-}" ]; then
+            echo "::error::No APK found under app/build/outputs/apk/release"
+            find app/build/outputs -type f || true
+            exit 1
+          fi
+          echo "path=$APK" >> "$GITHUB_OUTPUT"
+          SIZE=$(du -h "$APK" | cut -f1)
+          echo "size=$SIZE" >> "$GITHUB_OUTPUT"
+          echo "APK: $APK ($SIZE)"
+
+      # ------------------------------------------------------------
+      # 10. 生成 changelog:上一 tag 之后的所有 commit,或全历史(首个 tag)
+      # ------------------------------------------------------------
+      - name: Generate changelog
+        id: cl
+        run: |
+          set -euo pipefail
+          CURRENT_TAG="${{ github.ref_name }}"
+          # 找另一个最近的 tag(排除自身)
+          PREV_TAG=$(git tag --sort=-version:refname \
+                       | grep -v "^${CURRENT_TAG}$" \
+                       | head -n1 || true)
+          if [ -n "$PREV_TAG" ]; then
+            RANGE="$PREV_TAG..${{ github.sha }}"
+          else
+            RANGE="${{ github.sha }}"
+          fi
+          NOTES=$(git log "$RANGE" --pretty=format:"- %s (%h)" --no-merges)
+          if [ -z "$NOTES" ]; then
+            NOTES="- 首次构建"
+          fi
+          {
+            echo "notes<<'EOF'"
+            echo "$NOTES"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+          echo "----- changelog -----"
+          echo "$NOTES"
+          echo "---------------------"
+
+      # ------------------------------------------------------------
+      # 11. 创建 GitHub Release + 上传 APK
+      #     prerelease 自动判定:含 - 则视为 prerelease
+      # ------------------------------------------------------------
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: ${{ github.ref_name }}
+          tag_name: ${{ github.ref_name }}
+          body: |
+            ## 变更日志
+
+            ${{ steps.cl.outputs.notes }}
+
+            ---
+
+            | 字段 | 值 |
+            | --- | --- |
+            | 版本 | `${{ steps.version.outputs.name }}` |
+            | 提交 | `${{ github.sha }}` |
+            | 触发者 | @${{ github.actor }} |
+            | APK 大小 | ${{ steps.apk.outputs.size }} |
+            | Gradle | 8.7 |
+            | AGP | 8.5.2 |
+            | Kotlin | 1.9.24 |
+          files: ${{ steps.apk.outputs.path }}
+          fail_on_unmatched_files: true
+          prerelease: ${{ contains(github.ref_name, '-') }}
