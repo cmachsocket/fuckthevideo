@@ -195,9 +195,9 @@ jobs:
             NOTES="- 首次构建"
           fi
           {
-            echo "notes<<'EOF'"
+            echo "notes<<CHANGELOG_END"
             echo "$NOTES"
-            echo "EOF"
+            echo "CHANGELOG_END"
           } >> "$GITHUB_OUTPUT"
           echo "----- changelog -----"
           echo "$NOTES"
