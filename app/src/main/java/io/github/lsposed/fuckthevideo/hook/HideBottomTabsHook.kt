@@ -82,7 +82,6 @@ class HideBottomTabsHook(
         scanRecursive(root, depth = 0)
         Log.i(TAG, "[$packageName] === scan #${processScanCount.get()} end ===")
     }
-    }
 
     /**
      * 全树 DFS,每到一处就把 view 的关键属性打印出来。
