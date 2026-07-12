@@ -1,16 +1,16 @@
 [versions]
 agp = "8.5.2"
 kotlin = "1.9.24"
-xposedApi = "82"
+libxposedApi = "102"
 
 # Android SDK
 compileSdk = "34"
-minSdk = "26"
+minSdk = "27"   # Vector 框架从 Android 8.1 (API 27) 起支持
 targetSdk = "34"
 
 [libraries]
-# LSPosed / Xposed API stub — runtime 由 LSPosed 框架注入
-xposed-api = { group = "de.robv.android.xposed", name = "api", version.ref = "xposedApi" }
+# libxposed (Vector / 现代 Xposed) — 已发到 Maven Central,无需私有仓库
+libxposed-api = { group = "io.github.libxposed", name = "api", version.ref = "libxposedApi" }
 
 [plugins]
 android-application = { id = "com.android.application", version.ref = "agp" }

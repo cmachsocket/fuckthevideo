@@ -13,12 +13,6 @@ android {
         targetSdk = libs.versions.targetSdk.get().toInt()
         versionCode = 1
         versionName = "0.1.0"
-
-        // 收敛到目标 ABI,大幅瘦身
-        ndk {
-            // 无 native code,留个空模板注释
-            // abiFilters += listOf("arm64-v8a", "x86_64")
-        }
     }
 
     buildTypes {
@@ -33,7 +27,7 @@ android {
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
             )
-            // 没签 releaseKey 的话,LSPosed/手机不会装;本地测试用 debug 别用 release
+            // 默认 debug 签名,要换正式签名见 README
             signingConfig = signingConfigs.getByName("debug")
         }
     }
@@ -51,7 +45,15 @@ android {
         viewBinding = false
     }
 
-    // CI (GitHub Actions) 上不能因为 lint 警告就 fail,主要怕 hook stub 反射失败那一类
+    // ---- libxposed 必需 ----
+    // 把 META-INF/xposed/* 合并进 APK(framework 通过 java_init.list 读取入口)
+    packaging {
+        resources {
+            merges += "META-INF/xposed/*"
+        }
+    }
+
+    // CI 上不能因为 lint 警告就 fail
     lint {
         abortOnError = false
         checkReleaseBuilds = false
@@ -59,6 +61,6 @@ android {
 }
 
 dependencies {
-    // 仅在编译期需要,运行时由 LSPosed 注入,不能 implementation
-    compileOnly(libs.xposed.api)
+    // 运行时由 Vector 框架注入,故 compileOnly。不能 implementation。
+    compileOnly(libs.libxposed.api)
 }

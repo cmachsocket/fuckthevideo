@@ -2,35 +2,22 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
     <!--
-      LSPosed 模块:不需任何权限、不需 launcher Activity。
-      进程由 LSPosed 框架注入到作用域 app,所以本体不需要常驻。
+      Vector / libxposed 模块不再用 <meta-data>:
+        · 模块名 = android:label
+        · 描述   = android:description
+        · 作用域 = res/META-INF/xposed/scope.list
+        · API 范围 = res/META-INF/xposed/module.prop
+        · 入口   = res/META-INF/xposed/java_init.list
+
+      不需要任何 <activity>,也不需要 <receiver>/<service>。
+      进程由 Vector 框架注入到作用域 app,然后 framework 用 java_init.list 列出的
+      类名反射加载并调用 onModuleLoaded/onPackageLoaded/onPackageReady。
     -->
 
     <application
         android:label="@string/app_name"
+        android:description="@string/app_description"
         android:allowBackup="true"
-        android:supportsRtl="true">
-
-        <!-- 标识这是一个 LSPosed/Xposed 模块 -->
-        <meta-data
-            android:name="xposedmodule"
-            android:value="true" />
-
-        <!-- 描述(在 LSPosed Manager 列表里显示) -->
-        <meta-data
-            android:name="xposeddescription"
-            android:value="@string/xposed_description" />
-
-        <!-- 作用域:具体包名数组,详见 arrays.xml -->
-        <meta-data
-            android:name="xposedscope"
-            android:resource="@array/xposed_scope" />
-
-        <!-- 最低 Xposed 桥接版本(API 82 对应 Xposed API 82,所有 LSPosed 都支持) -->
-        <meta-data
-            android:name="xposedminversion"
-            android:value="82" />
-
-    </application>
+        android:supportsRtl="true" />
 
 </manifest>
