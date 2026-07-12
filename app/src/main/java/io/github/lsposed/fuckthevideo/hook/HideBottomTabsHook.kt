@@ -10,32 +10,19 @@ import io.github.libxposed.api.XposedModule
 import java.lang.reflect.Method
 
 /**
- * 业务 hook:从 App 主页底部 Tab 里隐藏指定节点。
+ * 侦探模式:撤销 bottom-local 优化,退回全树 DFS。
  *
- * ## 性能问题
+ * 性能问题先放一边 — 命中错的位置更重要。每命中一个 candidate,
+ * 打 [TAG]+view.class+desc+bounds+parent 信息到 logcat。
  *
- * 老 hook(9dd2b23 MainHook.java → 上一版 Hook.kt)每次 onResume 都全树 DFS,
- * 京东 decorView 1500+ 节点,淘宝 300+,扫一遍 5-15ms,体感卡顿。
+ * 工作流:
+ *   1. 装模块进手机
+ *   2. 启动京东 / 淘宝,等底部 tab 显示出来
+ *   3. `adb logcat -s HideBottomTabs` 看候选
+ *   4. 把 logcat + UI dump 给我,我精校 spec
  *
- * ## 改进要点
- *
- * 1. **每个 Activity 实例只扫一次**
- *    用 [WeakHashMap] 记录"这个 Activity 已经被 hide 过了",后续 onResume
- *    直接 return。弱引用,Activity 死了 GC 自动回收,不需要手动清理。
- *
- * 2. **post 到主线程队列末,不在 hook 同帧抢 layout 时间**
- *    hook 回调立即返回(0 cost),真正扫描放到主线程下个消息。
- *
- * 3. **bottombar 局部扫描 — 最后 N 个 children 直接检查**
- *    拼多多 / 淘宝 / 京东等主流 App,bottombar 几乎一定位于 decorView
- *    最后 1-3 个 FrameLayout 里。我们先扫这 [BOTTOM_DEPTH] 个,命中即收,
- *    跳过整树 DFS。落空时才 fallback 到 DFS。复杂度从 O(n) 降到 O(depth)。
- *
- * 4. **三种 hide 策略可选,REMOVE 默认**
- *    [HideStrategy.GONE] 仅折叠占位 / [HideStrategy.REMOVE] 父层 removeView
- *    + requestLayout / [HideStrategy.ZERO_SIZE] 把尺寸清 0。
- *
- * 这样 Tap TheVideo 进入主页时,实际扫的节点量 < 100,体感卡顿消失。
+ * 注意 onResume 阶段别反复 DFS 拖慢 — 用 [WeakHashMap] 每个 Activity
+ * 只扫一次,避免拖慢启动时间。
  */
 class HideBottomTabsHook(
     private val module: XposedModule,
@@ -45,14 +32,17 @@ class HideBottomTabsHook(
 ) {
     companion object {
         private const val TAG = "HideBottomTabs"
-        /** setTag 用的 key,标记本轮已处理过的 view(防 fragment 重 inf 时重复处理) */
+        /** setTag key,防止重复挂同一 view */
         private const val VIEW_TAG_PROCESSED = 0x7f0a0001
-        /** 底部扫描深度 — decorView 最后几个 children */
-        private const val BOTTOM_DEPTH = 4
+        /** Log.d verbosity flag — false 时只打命中前的候选,warning 才出 */
+        const val DEBUG_CANDIDATES = true
+        /** 每个 Activity 实例只扫一次:onResume 反复触发不算 */
+        const val MAX_SCANS_PER_PROCESS = 5
     }
 
     private val mainHandler = Handler(Looper.getMainLooper())
     private val activityScanned = java.util.WeakHashMap<Activity, Boolean>()
+    private val processScanCount = java.util.concurrent.atomic.AtomicInteger(0)
 
     private val onResume: Method by lazy {
         Activity::class.java.getDeclaredMethod("onResume")
@@ -74,78 +64,87 @@ class HideBottomTabsHook(
             if (activityScanned[activity] == true) return
             activityScanned[activity] = true
         }
+        // 没到 quota 才 post
+        if (processScanCount.incrementAndGet() > MAX_SCANS_PER_PROCESS) {
+            Log.d(TAG, "[$packageName] process-wide scan quota reached, skip")
+            return
+        }
         mainHandler.post { scanForActivity(activity) }
     }
 
     private fun scanForActivity(activity: Activity) {
         if (activity.isFinishing || activity.isDestroyed) return
-        val root = activity.window?.decorView as? ViewGroup ?: return
-
-        if (scanLocalBottom(root)) {
-            Log.d(TAG, "[$packageName] bottom-local hit, done")
+        val root = activity.window?.decorView as? ViewGroup ?: run {
+            Log.w(TAG, "[$packageName] no decorView")
             return
         }
-        // fallback:整树 DFS — 现在仅当本地未命中才执行
-        Log.d(TAG, "[$packageName] bottom-local miss, fallback DFS")
-        scanRecursive(root)
+        Log.i(TAG, "[$packageName] === scan #${processScanCount.get()} begin ===")
+        scanRecursive(root, depth = 0)
+        Log.i(TAG, "[$packageName] === scan #${processScanCount.get()} end ===")
+    }
     }
 
     /**
-     * 只看 decorView 最后 [BOTTOM_DEPTH] 个 children:
-     * - 如果其中任意一个 spec 命中,hide 它,return true。
-     * - 否则扫描完这 BOTTOM_DEPTH 个树(仍 DFS 但只 DFS 这几棵子树),看
-     *   它们内部有没有命中 spec,return 最终命中与否。
-     *
-     * 复杂度严格 ≤ O(每个 bottom-children 树的节点数),
-     * 主屏 bottombar 通常 < 200 节点,远比整个 decorView (1500+) 小。
+     * 全树 DFS,每到一处就把 view 的关键属性打印出来。
+     * 即使没有 spec 命中,也按"candidates-inspected"输出节选,方便排查。
      */
-    private fun scanLocalBottom(root: ViewGroup): Boolean {
-        val n = root.childCount
-        if (n == 0) return false
-        val from = maxOf(0, n - BOTTOM_DEPTH)
-        var anyHit = false
-        for (i in (n - 1) downTo from) {
-            val child = root.getChildAt(i) ?: continue
-            if (scanRecursiveReturningHit(child)) anyHit = true
+    private fun scanRecursive(view: View, depth: Int) {
+        if (view is ViewGroup && view.id != View.NO_ID) {
+            val name = runCatching { view.resources.getResourceEntryName(view.id) }
+                .getOrNull()
+            // 每命中一次 id-bearing ViewGroup,无论是否 spec 命中,都 log
+            if (DEBUG_CANDIDATES && shouldLogClass(view.javaClass)) {
+                Log.d(
+                    TAG,
+                    "[$packageName]   ${
+                        "  ".repeat(depth.coerceAtMost(8))
+                    }${view.javaClass.simpleName}#${name} " +
+                        "bounds=${formatBounds(view)} " +
+                        "desc='${view.contentDescription}' " +
+                        "clickable=${view.isClickable} " +
+                        "parentIdx=${(view.parent as? ViewGroup)?.let { it.indexOfChild(view) }}"
+                )
+            }
         }
-        return anyHit
-    }
 
-    /** 子树 DFS 一遍;如果有任何命中,return true;否则 false。不在此处打日志避免重复输出。 */
-    private fun scanRecursiveReturningHit(view: View): Boolean {
         for (spec in specs) {
             if (spec.matches(view)) {
+                Log.w(
+                    TAG,
+                    "[$packageName] ★ HIT ★ class=${view.javaClass.simpleName} " +
+                        "spec=$spec bounds=${formatBounds(view)} desc='${view.contentDescription}'"
+                )
                 applyHide(view)
-                return true
+                // 命中后继续扫 — 同 spec 可能在其他 sibling 上
             }
         }
+
         if (view is ViewGroup) {
             for (i in 0 until view.childCount) {
-                if (scanRecursiveReturningHit(view.getChildAt(i))) return true
+                scanRecursive(view.getChildAt(i), depth + 1)
             }
         }
-        return false
     }
 
-    /** DFS 一遍,见命中就 hid,继续扫完所有,适合 fallback 路径 */
-    private fun scanRecursive(view: View) {
-        for (spec in specs) {
-            if (spec.matches(view)) {
-                applyHide(view)
-                // 命中后不 return — 同一 spec 可能在多个兄弟节点上(罕见),继续
-            }
-        }
-        if (view is ViewGroup) {
-            for (i in 0 until view.childCount) {
-                scanRecursive(view.getChildAt(i))
-            }
-        }
+    private fun shouldLogClass(klass: Class<*>): Boolean {
+        val simple = klass.simpleName
+        return simple.contains("FrameLayout") ||
+            simple.contains("LinearLayout") ||
+            simple.contains("RecyclerView") ||
+            simple.contains("ConstraintLayout") ||
+            simple.contains("RelativeLayout")
+    }
+
+    private fun formatBounds(view: View): String {
+        val r = IntArray(2)
+        view.getLocationInWindow(r)
+        // android.view.View 标准的 getLocationInWindow 输出 (x,y),但我们想看全 bounds
+        return "[${view.left},${view.top} ${view.right},${view.bottom}]"
     }
 
     private fun applyHide(view: View) {
         if (view.getTag(VIEW_TAG_PROCESSED) == true) return
         view.setTag(VIEW_TAG_PROCESSED, true)
-
         Log.d(TAG, "[$packageName] hide ${view.javaClass.simpleName} strategy=$strategy")
         when (strategy) {
             HideStrategy.GONE -> view.visibility = View.GONE
