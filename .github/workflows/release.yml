@@ -49,21 +49,76 @@ jobs:
           build-tools-version: 34.0.0
 
       # ------------------------------------------------------------
-      # 4. Gradle 8.7 (读 gradle-wrapper.properties)
-      #    此 action 会:
-      #    - 自动装 gradle 8.7
-      #    - 如果仓库里没有 gradlew / gradle-wrapper.jar,自动生成
-      #    - 自带缓存
+      # 4. Gradle wrapper 自举
+      #
+      # 为什么这么做:
+      #   gradle/actions/setup-gradle@v4 默认查找 ./gradlew + gradle-wrapper.jar。
+      #   本项目只 commit 了 gradle-wrapper.properties,缺少 wrapper jar 和脚本。
+      #   改用「bootstrap」:先下 gradle 8.7 二进制,用 `gradle wrapper` 命令把
+      #   缺的 jar + gradlew 脚本生成出来,后面 ./gradlew 就能跑了。
+      #
+      # 缓存 .gradle-bootstrap 和 wrapper artifacts,第二次构建跳过下载。
       # ------------------------------------------------------------
-      - name: Set up Gradle
-        uses: gradle/actions/setup-gradle@v4
+      - name: Cache wrapper bootstrap
+        uses: actions/cache@v4
         with:
-          gradle-version: 8.7
+          path: |
+            .gradle-bootstrap
+            gradle/wrapper/gradle-wrapper.jar
+            gradlew
+            gradlew.bat
+          key: ${{ runner.os }}-wrapper-8.7
+          restore-keys: |
+            ${{ runner.os }}-wrapper-
+
+      - name: Bootstrap Gradle wrapper (首次)
+        shell: bash
+        run: |
+          set -euo pipefail
+          GRADLE_VERSION=8.7
+
+          # 已就绪(命中缓存),跳过
+          if [ -x ./gradlew ] && [ -f gradle/wrapper/gradle-wrapper.jar ]; then
+            echo "==> gradlew 已就绪(缓存命中)"
+            ./gradlew --version 2>&1 | head -10
+            exit 0
+          fi
+
+          echo "==> 下载 gradle ${GRADLE_VERSION}..."
+          mkdir -p .gradle-bootstrap
+          curl -fL --retry 3 --retry-delay 2 -o ".gradle-bootstrap/gradle-${GRADLE_VERSION}-bin.zip" \
+            "https://services.gradle.org/distributions/gradle-${GRADLE_VERSION}-bin.zip"
+
+          echo "==> 解压..."
+          unzip -q ".gradle-bootstrap/gradle-${GRADLE_VERSION}-bin.zip" -d .gradle-bootstrap/
+
+          echo "==> 生成 wrapper jar + gradlew 脚本..."
+          .gradle-bootstrap/gradle-${GRADLE_VERSION}/bin/gradle wrapper \
+            --gradle-version "${GRADLE_VERSION}" --distribution-type bin
+
+          chmod +x gradlew
+          echo "==> wrapper 验证:"
+          ./gradlew --version 2>&1 | head -10
 
       # ------------------------------------------------------------
-      # 5. 从 tag 计算版本号
-      #    ref_name = "v0.1.0" → name = "0.1.0"
-      #    versionCode = epoch 后 7 位(单调递增,够用)
+      # Gradle 全局缓存(项目级 ~/.gradle/caches / .gradle/)
+      # ------------------------------------------------------------
+      - name: Cache Gradle project caches
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+            .gradle
+            build/
+          key: ${{ runner.os }}-gradle-${{ hashFiles('**/*.gradle.kts', '**/gradle-wrapper.properties', 'gradle/libs.versions.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-gradle-
+
+      # ------------------------------------------------------------
+      # Versioning: 从 tag 计算版本号
+      #   ref_name = "v0.1.0" → versionName = "0.1.0"
+      #   versionCode = epoch 后 7 位(单调递增,够用)
       # ------------------------------------------------------------
       - name: Compute version
         id: version
@@ -77,8 +132,8 @@ jobs:
           echo "Resolved versionName=$VERSION  versionCode=$CODE"
 
       # ------------------------------------------------------------
-      # 6. 把版本号写进 app/build.gradle.kts
-      #    这里的 target 是 Kotlin DSL 文件,行尾可能有注释,正则要宽容
+      # Versioning: 把版本号写进 app/build.gradle.kts
+      #   Kotlin DSL 文件,行可能有注释,正则要宽容
       # ------------------------------------------------------------
       - name: Inject version into build.gradle.kts
         run: |
@@ -89,19 +144,19 @@ jobs:
           grep -E "[[:space:]]*version(Code|Name)[[:space:]]*=" app/build.gradle.kts
 
       # ------------------------------------------------------------
-      # 7. local.properties — sdk.dir
+      # Build: local.properties — sdk.dir
       # ------------------------------------------------------------
       - name: Write local.properties
         run: echo "sdk.dir=$ANDROID_SDK_ROOT" > local.properties
 
       # ------------------------------------------------------------
-      # 8. 真正编译
+      # Build: 真正编译
       # ------------------------------------------------------------
       - name: Build release APK
         run: ./gradlew :app:assembleRelease --stacktrace --warning-mode summary
 
       # ------------------------------------------------------------
-      # 9. 找到产物
+      # Artifacts: 找到产物
       # ------------------------------------------------------------
       - name: Locate APK
         id: apk
@@ -119,7 +174,7 @@ jobs:
           echo "APK: $APK ($SIZE)"
 
       # ------------------------------------------------------------
-      # 10. 生成 changelog:上一 tag 之后的所有 commit,或全历史(首个 tag)
+      # Artifacts: 生成 changelog(上一 tag 到 HEAD 的所有 commit)
       # ------------------------------------------------------------
       - name: Generate changelog
         id: cl
@@ -149,8 +204,9 @@ jobs:
           echo "---------------------"
 
       # ------------------------------------------------------------
-      # 11. 创建 GitHub Release + 上传 APK
-      #     prerelease 自动判定:含 - 则视为 prerelease
+      # Release: 创建 GitHub Release + 上传 APK
+      #   prerelease 自动判定:tag 含 - 则视为 prerelease
+      #   files: 上传 APK 到 Release assets
       # ------------------------------------------------------------
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2

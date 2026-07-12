@@ -119,13 +119,13 @@ git push origin v0.1.0
 
 1. checkout 拉全 git 历史
 2. JDK 17 + Android SDK 34 + Build-Tools 34.0.0
-3. Gradle 8.7(读 `gradle-wrapper.properties`,自动装、自动缓存)
+3. **Bootstrap Gradle wrapper** — 仓库只提交了 `gradle-wrapper.properties`,没 commit wrapper jar 和 `gradlew` 脚本。CI 会先下 gradle 8.7 二进制,用 `gradle wrapper` 命令把缺的 wrapper artifacts 生成出来,缓存到下次复用
 4. 从 tag 算出 `versionName`(`v0.1.0` → `0.1.0`)和 `versionCode`(epoch 后 7 位)
 5. 自动写回 `app/build.gradle.kts`
 6. `./gradlew :app:assembleRelease` 编译
 7. 收集 `app-release.apk`
 8. 取上一个 tag 到 HEAD 的全部 commit,自动生成 changelog
-9. 创建 GitHub Release 并上传 APK
+9. 创建 GitHub Release,上传 APK 到 assets(全文件持久可下)
 
 ### 签名
 
