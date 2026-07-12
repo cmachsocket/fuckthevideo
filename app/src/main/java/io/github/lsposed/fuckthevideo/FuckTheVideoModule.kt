@@ -1,8 +1,6 @@
 package io.github.lsposed.fuckthevideo
 
-import android.os.Build
 import android.util.Log
-import androidx.annotation.RequiresApi
 import io.github.libxposed.api.XposedModule
 import io.github.libxposed.api.XposedModuleInterface.ModuleLoadedParam
 import io.github.libxposed.api.XposedModuleInterface.PackageLoadedParam
@@ -46,7 +44,8 @@ class FuckTheVideoModule : XposedModule() {
         )
     }
 
-    @RequiresApi(Build.VERSION_CODES.Q)
+    // @RequiresApi(Q) 来自父接口 XposedModuleInterface 的 @RequiresApi(Q),
+    // Kotlin override 自动继承,无需重复声明
     override fun onPackageLoaded(param: PackageLoadedParam) {
         Log.d(TAG, "onPackageLoaded: ${param.packageName} (first=${param.isFirstPackage})")
     }
