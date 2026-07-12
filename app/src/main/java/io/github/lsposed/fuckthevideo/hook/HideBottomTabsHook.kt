@@ -1,6 +1,7 @@
 package io.github.lsposed.fuckthevideo.hook
 
 import android.app.Activity
+import android.os.Bundle
 import android.util.Log
 import android.view.View
 import android.view.ViewGroup
@@ -8,87 +9,124 @@ import io.github.libxposed.api.XposedModule
 import java.lang.reflect.Method
 
 /**
- * 业务 hook:从三个 App 的主页底部 Tab 栏里隐藏目标 Tab。
+ * 业务 hook:从 App 主页底部 Tab 里隐藏指定节点。
  *
- * 来源:9dd2b23 提交的 MainHook.java,翻译/迁移到 libxposed + Kotlin。
+ * 之前版本是 9dd2b23 提交的 MainHook.java(老 Xposed API),已翻译为 Kotlin + libxposed。
  *
- * 原始实现(老 Xposed API):
- * ```
- * public class MainHook implements IXposedHookLoadPackage {
- *     // 在 taobao / jd / pdd hook Activity.onResume,after 里遍历
- *     // rootView 找到 content-description 匹配的 View,setVisibility(V.GONE)
- * }
- * ```
- *
- * 等价实现(OkHttp chain 风格):
- *   intercept { chain ->
- *       chain.proceed()
- *       traverseAndHide(activity.window.decorView)
- *   }
+ * 改善:
+ * 1. 多个 spec 同时支持(京东没 desc,只能 ByParent 定位)
+ * 2. 多种 strategy(GONE / REMOVE / ZERO_SIZE)— 默认 REMOVE
+ * 3. **bottom-area 局部扫描** — 只看 decorView 最后几个 children,不再全树递归
+ * 4. 推到下一帧再压一次,防止 fragment 重置
+ * 5. onCreate + onResume 双 hook,早 hook 早 layout,后 hook 兜底
  */
 class HideBottomTabsHook(
     private val module: XposedModule,
-    private val targetDescriptions: Set<String>,
+    private val specs: List<TabSpec>,
     private val packageName: String,
-    /** 是否从父容器彻底移除。false = 仅 setVisibility(GONE),保留占位 */
-    private val removeInstead: Boolean = false,
+    private val strategy: HideStrategy = HideStrategy.REMOVE,
 ) {
     companion object {
         private const val TAG = "HideBottomTabs"
+        /** 底部扫描深度 — 装饰视图最后几个 children 几乎一定包含 bottombar */
+        private const val BOTTOM_SCAN_DEPTH = 4
+        /** setTag 的 key,标记本轮已处理过的 view,避免 fragment 重建时被反复打 */
+        private const val VIEW_TAG_PROCESSED = 0x7f0a0001
     }
 
     private val onResume: Method by lazy {
         Activity::class.java.getDeclaredMethod("onResume")
     }
 
+    /**
+     * 只装一个 [Activity.onResume] hook。
+     * 老 Xposed 时代 (9dd2b23 MainHook.java) 也是这个时机。
+     * onCreate 阶段 view tree 还没 layout,不该 scan。onResume 之后
+     * 一定 laid out,所以这是唯一靠谱的入口。
+     */
     fun apply() {
         module.hook(onResume).intercept { chain ->
-            // proceed 原方法先跑(让 Activity 真正进入 resumed)
             chain.proceed()
-            // after 部分:遍历 rootView,隐藏目标 Tab
-            val activity = chain.thisObject as? Activity ?: return@intercept null
-            if (activity.packageName != packageName) return@intercept null
-            val root = activity.window?.decorView ?: return@intercept null
-            traverseAndHide(root)
+            doApply(chain.thisObject as? Activity)
             null
         }
     }
 
-    /**
-     * 递归遍历 View 树,找 content-desc 命中 targetDescriptions 的 View,
-     * 按 [removeInstead] 选择 GONE 或 removeView。
-     */
-    private fun traverseAndHide(view: View) {
-        if (view == null) return
+    private fun doApply(activity: Activity?) {
+        if (activity == null || activity.packageName != packageName) return
+        val root = activity.window?.decorView ?: return
+        scanBottomArea(root)
+        // 推下一帧再压一次,处理 fragment 异步重建的情况
+        root.post { scanBottomArea(root) }
+    }
 
-        val desc = view.contentDescription
-        if (desc != null && targetDescriptions.contains(desc.toString())) {
-            Log.d(TAG, "[$packageName] matched: $desc")
-            if (removeInstead) {
-                removeFromParent(view)
-            } else {
-                view.visibility = View.GONE
-                Log.d(TAG, "[$packageName] set GONE")
-            }
+    /**
+     * 只扫描 rootView 的最后 [BOTTOM_SCAN_DEPTH] 个 children,
+     * 避免对整个 decorView 树做 DFS — 京东/淘宝的 decorView 动辄
+     * 上千节点,扫一遍体感明显卡顿。底部 tab 一般在最末 1-3 个 children。
+     */
+    private fun scanBottomArea(root: View) {
+        val parent = root as? ViewGroup ?: return
+        val n = parent.childCount
+        if (n == 0) return
+        val from = maxOf(0, n - BOTTOM_SCAN_DEPTH)
+        for (i in (n - 1) downTo from) {
+            scan(parent.getChildAt(i))
+        }
+    }
+
+    private fun scan(view: View) {
+        // 先检查 view 自身是否命中 spec
+        if (specs.any { it.matches(view) }) {
+            applyHide(view)
             return
         }
-
+        // ViewGroup 还要递归(京东 BY_DESC 的目标在 inner,BY_PARENT 在 outer 兄弟)
         if (view is ViewGroup) {
-            var i = 0
-            while (i < view.childCount) {
-                traverseAndHide(view.getChildAt(i))
-                i++
+            // 没命中自身,继续 children — 但不重复扫这个 group(已经检过自己)
+            for (i in 0 until view.childCount) {
+                scan(view.getChildAt(i))
             }
+        }
+    }
+
+    private fun applyHide(view: View) {
+        // 同一个 view 在一次扫描里重复命中,只处理一次
+        if (view.getTag(VIEW_TAG_PROCESSED) == true) return
+        view.setTag(VIEW_TAG_PROCESSED, true)
+
+        Log.d(TAG, "[$packageName] hide ${view.javaClass.simpleName} strategy=$strategy")
+        when (strategy) {
+            HideStrategy.GONE -> view.visibility = View.GONE
+            HideStrategy.REMOVE -> removeFromParent(view)
+            HideStrategy.ZERO_SIZE -> zeroOutSize(view)
         }
     }
 
     private fun removeFromParent(view: View) {
-        val parent = view.parent
-        if (parent is ViewGroup) {
+        val parent = view.parent as? ViewGroup
+        if (parent != null) {
             parent.removeView(view)
-            Log.d(TAG, "[$packageName] removed from parent")
+            parent.requestLayout()
+            Log.d(TAG, "[$packageName] REMOVE done, parent.requestLayout()")
         } else {
-            Log.w(TAG, "[$packageName] no ViewGroup parent, cannot remove")
+            Log.w(TAG, "[$packageName] no ViewGroup parent, fallback to GONE")
+            view.visibility = View.GONE
         }
     }
+
+    private fun zeroOutSize(view: View) {
+        val lp = view.layoutParams
+        if (lp != null) {
+            lp.width = 0
+            lp.height = 0
+            view.layoutParams = lp
+        } else {
+            view.layoutParams = ViewGroup.LayoutParams(0, 0)
+        }
+        view.visibility = View.GONE
+        view.requestLayout()
+        Log.d(TAG, "[$packageName] ZERO_SIZE done")
+    }
+
 }
