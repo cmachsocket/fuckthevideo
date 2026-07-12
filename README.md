@@ -48,9 +48,9 @@ fuckthevideo/
 │   └── src/main/
 │       ├── AndroidManifest.xml        # 只剩 label + description
 │       ├── java/io/github/lsposed/fuckthevideo/
-│       │   ├── FuckTheVideoModule.kt  # 入口:继承 XposedModule
+│       │   ├── FuckTheVideoModule.kt  # 入口:继承 XposedModule,按包名 dispatch
 │       │   └── hook/
-│       │       └── DemoHook.kt        # 示例 hook:拦 Activity.onCreate (OkHttp chain 风格)
+│       │       └── HideBottomTabsHook.kt  # 业务 hook:勾 Activity.onResume 隐藏底部 Tab
 │       ├── resources/META-INF/xposed/  ← libxposed 配置在这里
 │       │   ├── java_init.list         # 入口类全限定名(framework 通过这个发现模块)
 │       │   ├── scope.list             # 作用域:每行一个包名,或 *

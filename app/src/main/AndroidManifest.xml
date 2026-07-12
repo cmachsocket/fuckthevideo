@@ -2,16 +2,12 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
     <!--
-      Vector / libxposed 模块不再用 <meta-data>:
+      Vector / libxposed 模块:
         · 模块名 = android:label
         · 描述   = android:description
-        · 作用域 = res/META-INF/xposed/scope.list
+        · 作用域 = res/META-INF/xposed/scope.list(三个目标包)
         · API 范围 = res/META-INF/xposed/module.prop
         · 入口   = res/META-INF/xposed/java_init.list
-
-      不需要任何 <activity>,也不需要 <receiver>/<service>。
-      进程由 Vector 框架注入到作用域 app,然后 framework 用 java_init.list 列出的
-      类名反射加载并调用 onModuleLoaded/onPackageLoaded/onPackageReady。
     -->
 
     <application
