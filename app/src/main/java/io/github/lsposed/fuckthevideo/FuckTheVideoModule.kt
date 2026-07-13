@@ -24,10 +24,19 @@ class FuckTheVideoModule : XposedModule() {
         private const val TAG = "FuckTheVideo"
         private const val SELF_PKG = "io.github.lsposed.fuckthevideo"
 
-        private data class Target(val pkg: String, val specs: List<TabSpec>)
+        private data class Target(
+            val pkg: String,
+            val scanRootResourceId: String? = null,
+            val specs: List<TabSpec>,
+        )
 
         /**
-         * 业务白名单 — 京东额外加了 ByParent 兜底(只靠 ByDesc 出现 GONE 不彻底问题)
+         * 业务白名单
+         *
+         * - 淘宝 / 拼多多:外层 FrameLayout 自带 content-desc,ByDesc 一招鲜,默认入口(decorView 末 4 children)
+         * - 京东:外层 FrameLayout 无 desc,desc 在内层 View 上,改用 ByDescendantOf
+         *         锁定 "逛" 子串(产品定位核心词,改名 "逛2元"、"逛3元" 都能命中)
+         *         并锁入口 id/fl,跳过 decorView 启发式
          */
         private val TARGETS = listOf(
             Target(
@@ -36,12 +45,12 @@ class FuckTheVideoModule : XposedModule() {
             ),
             Target(
                 pkg = "com.jingdong.app.mall",
+                scanRootResourceId = "com.jingdong.app.mall:id/fl",
                 specs = listOf(
-                    TabSpec.ByParent(
+                    TabSpec.ByDescendantOf(
                         parentResourceName = "com.jingdong.app.mall:id/fl",
-                        childIndex = 1,
+                        descendantContentDesc = "逛",
                     ),
-                    TabSpec.ByDesc("视频"),
                 ),
             ),
             Target(
@@ -73,6 +82,7 @@ class FuckTheVideoModule : XposedModule() {
             module = this,
             specs = target.specs,
             packageName = target.pkg,
+            scanRootResourceId = target.scanRootResourceId,
             strategy = GLOBAL_STRATEGY,
         ).apply()
     }

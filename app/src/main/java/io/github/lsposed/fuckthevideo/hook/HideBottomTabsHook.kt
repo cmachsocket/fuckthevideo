@@ -24,6 +24,7 @@ class HideBottomTabsHook(
     private val module: XposedModule,
     private val specs: List<TabSpec>,
     private val packageName: String,
+    private val scanRootResourceId: String? = null,
     private val strategy: HideStrategy = HideStrategy.REMOVE,
 ) {
     companion object {
@@ -54,10 +55,24 @@ class HideBottomTabsHook(
 
     private fun doApply(activity: Activity?) {
         if (activity == null || activity.packageName != packageName) return
-        val root = activity.window?.decorView ?: return
-        scanBottomArea(root)
-        // 推下一帧再压一次,处理 fragment 异步重建的情况
-        root.post { scanBottomArea(root) }
+        val root = scanRootResourceId
+            ?.let { findViewByResourceName(activity, it) }
+            ?: activity.window?.decorView
+            ?: return
+        if (scanRootResourceId != null) {
+            // 锁入口:从指定 resource-id 直接 DFS,跳过 decorView 末 N children 的启发式
+            scan(root)
+            root.post { scan(root) }
+        } else {
+            // 默认:走 decorView 末 [BOTTOM_SCAN_DEPTH] 个 children 的启发式
+            scanBottomArea(root)
+            root.post { scanBottomArea(root) }
+        }
+    }
+
+    private fun findViewByResourceName(activity: Activity, name: String): View? {
+        val resId = activity.resources.getIdentifier(name, "id", packageName)
+        return if (resId != 0) activity.findViewById(resId) else null
     }
 
     /**

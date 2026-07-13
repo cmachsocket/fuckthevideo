@@ -14,11 +14,31 @@ import android.view.ViewGroup
  * "parent resource-id = X 的第 N 个 child"。
  */
 sealed class TabSpec {
-    /** 内容描述匹配(淘宝 / PDD 默认走这个) */
+    /** 内容描述精确匹配(淘宝 / PDD 默认走这个) */
     data class ByDesc(val desc: String) : TabSpec()
 
-    /** 父容器 resource-id + 该 child 在父中的下标(0-based)(JD 没 desc 时用) */
+    /** 父容器 resource-id + 该 child 在父中的下标(0-based)(旧版京东走这个) */
     data class ByParent(val parentResourceName: String, val childIndex: Int) : TabSpec()
+
+    /**
+     * 父容器是 [parentResourceName] 的某个直接 child,
+     * 且该 child 的 descendants(包含自身)中至少有一个节点的
+     * content-desc **包含** [descendantContentDesc] 子串。
+     *
+     * 用 contains 而不是精确匹配的原因:
+     * - 京东"视频" Tab 历史上叫过 "逛"、"逛2元"、可能还会改。
+     *   但"逛"是产品定位核心词,大概率保留;锁定"逛"后改名自动跟上。
+     * - 外层容器 FrameLayout 本身通常没 desc,desc 在内层 View 上,
+     *   ByDesc 命中的是内层 View(藏错),ByDescendantOf 命中的是
+     *   id/fl 的直接 child FrameLayout(藏对整个 Tab)。
+     *
+     * 用法:
+     *   ByDescendantOf("com.jingdong.app.mall:id/fl", "逛")
+     */
+    data class ByDescendantOf(
+        val parentResourceName: String,
+        val descendantContentDesc: String,
+    ) : TabSpec()
 
     /**
      * 判断给定 view 是否对应这个 spec。
@@ -35,6 +55,29 @@ sealed class TabSpec {
             }.getOrNull()
             parentName == parentResourceName && parent.indexOfChild(view) == childIndex
         }
+        is ByDescendantOf -> {
+            val parent = view.parent as? ViewGroup ?: return false
+            val parentName = runCatching {
+                parent.resources.getResourceEntryName(parent.id)
+            }.getOrNull()
+            parentName == parentResourceName
+                && parent.indexOfChild(view) >= 0
+                && view.anyDescendantMatches { it.contains(descendantContentDesc) }
+        }
+    }
+
+    /**
+     * 在 view 自己 + 整棵子树里找 content-desc 满足 [predicate] 的节点。
+     * contentDescription 为 null 的节点降级为空串,contains 永远不命中 — 安全。
+     */
+    private fun View.anyDescendantMatches(predicate: (String) -> Boolean): Boolean {
+        if (predicate(this.contentDescription?.toString() ?: "")) return true
+        if (this is ViewGroup) {
+            for (i in 0 until childCount) {
+                if (getChildAt(i).anyDescendantMatches(predicate)) return true
+            }
+        }
+        return false
     }
 }
 
