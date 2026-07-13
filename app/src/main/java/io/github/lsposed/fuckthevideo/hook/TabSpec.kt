@@ -45,24 +45,29 @@ sealed class TabSpec {
      *
      * 注意:view 是被检查的"叶或中间节点",不包含顶层 rootView。
      * 这里匹配 view 本身,而不是它的 children(它本身被 hide,chidlren 也跟着不见)。
+     *
+     * 必须 block body(`{ return when {...} }`)— expression body(`= when {...}`)
+     * 里不能用 `return false`,编译器会拒绝(KT-8166 之类)。
      */
-    fun matches(view: View): Boolean = when (this) {
-        is ByDesc -> view.contentDescription?.toString() == desc
-        is ByParent -> {
-            val parent = view.parent as? ViewGroup ?: return false
-            val parentName = runCatching {
-                parent.resources.getResourceEntryName(parent.id)
-            }.getOrNull()
-            parentName == parentResourceName && parent.indexOfChild(view) == childIndex
-        }
-        is ByDescendantOf -> {
-            val parent = view.parent as? ViewGroup ?: return false
-            val parentName = runCatching {
-                parent.resources.getResourceEntryName(parent.id)
-            }.getOrNull()
-            parentName == parentResourceName
-                && parent.indexOfChild(view) >= 0
-                && view.anyDescendantMatches { it.contains(descendantContentDesc) }
+    fun matches(view: View): Boolean {
+        return when (this) {
+            is ByDesc -> view.contentDescription?.toString() == desc
+            is ByParent -> {
+                val parent = view.parent as? ViewGroup ?: return false
+                val parentName = runCatching {
+                    parent.resources.getResourceEntryName(parent.id)
+                }.getOrNull()
+                parentName == parentResourceName && parent.indexOfChild(view) == childIndex
+            }
+            is ByDescendantOf -> {
+                val parent = view.parent as? ViewGroup ?: return false
+                val parentName = runCatching {
+                    parent.resources.getResourceEntryName(parent.id)
+                }.getOrNull()
+                parentName == parentResourceName
+                    && parent.indexOfChild(view) >= 0
+                    && view.anyDescendantMatches { it.contains(descendantContentDesc) }
+            }
         }
     }
 
