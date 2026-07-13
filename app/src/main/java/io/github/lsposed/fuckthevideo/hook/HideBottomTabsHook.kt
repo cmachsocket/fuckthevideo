@@ -48,7 +48,12 @@ class HideBottomTabsHook(
     fun apply() {
         module.hook(onResume).intercept { chain ->
             chain.proceed()
-            doApply(chain.thisObject as? Activity)
+            // hook 内部任何异常都不能 kill 宿主 App — 吞了,只 log
+            try {
+                doApply(chain.thisObject as? Activity)
+            } catch (t: Throwable) {
+                Log.e(TAG, "[$packageName] doApply crashed", t)
+            }
             null
         }
     }
@@ -70,8 +75,8 @@ class HideBottomTabsHook(
         }
     }
 
-    private fun findViewByResourceName(activity: Activity, name: String): View? {
-        val resId = activity.resources.getIdentifier(name, "id", packageName)
+    private fun findViewByResourceName(activity: Activity, entryName: String): View? {
+        val resId = activity.resources.getIdentifier(entryName, "id", packageName)
         return if (resId != 0) activity.findViewById(resId) else null
     }
 

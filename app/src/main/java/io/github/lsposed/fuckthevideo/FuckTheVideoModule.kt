@@ -27,6 +27,7 @@ class FuckTheVideoModule : XposedModule() {
         private data class Target(
             val pkg: String,
             val scanRootResourceId: String? = null,
+            val strategy: HideStrategy = HideStrategy.REMOVE,
             val specs: List<TabSpec>,
         )
 
@@ -37,19 +38,26 @@ class FuckTheVideoModule : XposedModule() {
          * - 京东:外层 FrameLayout 无 desc,desc 在内层 View 上,改用 ByDescendantOf
          *         锁定 "逛" 子串(产品定位核心词,改名 "逛2元"、"逛3元" 都能命中)
          *         并锁入口 id/fl,跳过 decorView 启发式
+         *
+         * strategy 字段:
+         * - 默认 REMOVE,现代 layout 干净掋掉 tab
+         * - 淘宝用 TabHost(老式 widget),REMOVE 会导致 TabHost 内部 TabSpec.view 悬空、
+         *   下次 focus 切换 tab 时 NPE 闪退。改用 ZERO_SIZE(只把 tab 框拉成 0x0,
+         *   保持 view 在 parent children 里,TabHost 不知情)
          */
         private val TARGETS = listOf(
             Target(
                 pkg = "com.taobao.taobao",
+                strategy = HideStrategy.ZERO_SIZE,  // ← TabHost 安全,避免 REMOVE 崩宿主
                 specs = listOf(TabSpec.ByDesc("视频")),
             ),
             Target(
                 pkg = "com.jingdong.app.mall",
-                scanRootResourceId = "com.jingdong.app.mall:id/fl",
+                scanRootResourceId = "fl",  // ← entry name (不带 prefix),getIdentifier 只认 entry
                 specs = listOf(
                     TabSpec.ByDescendantOf(
                         parentResourceName = "com.jingdong.app.mall:id/fl",
-                        descendantContentDesc = "逛",
+                        descendantContentDesc = "逛",  // contains 匹配,抗改名
                     ),
                 ),
             ),
@@ -83,7 +91,7 @@ class FuckTheVideoModule : XposedModule() {
             specs = target.specs,
             packageName = target.pkg,
             scanRootResourceId = target.scanRootResourceId,
-            strategy = GLOBAL_STRATEGY,
+            strategy = target.strategy,  // per-Target 覆盖全局默认
         ).apply()
     }
 }
