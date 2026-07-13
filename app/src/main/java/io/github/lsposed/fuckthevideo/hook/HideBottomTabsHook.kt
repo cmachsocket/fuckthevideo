@@ -60,16 +60,18 @@ class HideBottomTabsHook(
 
     private fun doApply(activity: Activity?) {
         if (activity == null || activity.packageName != packageName) return
-        val root = scanRootResourceId
-            ?.let { findViewByResourceName(activity, it) }
-            ?: activity.window?.decorView
-            ?: return
         if (scanRootResourceId != null) {
-            // 锁入口:从指定 resource-id 直接 DFS,跳过 decorView 末 N children 的启发式
+            val root = findViewByResourceName(activity, scanRootResourceId)
+            if (root == null) {
+                // id 没找到 — 这活动不是带 id/fl 的页面,跳过
+                Log.d(TAG, "[$packageName] scanRootResourceId=$scanRootResourceId not found in ${activity.javaClass.simpleName}, skip")
+                return
+            }
+            Log.d(TAG, "[$packageName] entry locked to ${root.javaClass.simpleName} id=$scanRootResourceId")
             scan(root)
             root.post { scan(root) }
         } else {
-            // 默认:走 decorView 末 [BOTTOM_SCAN_DEPTH] 个 children 的启发式
+            val root = activity.window?.decorView ?: return
             scanBottomArea(root)
             root.post { scanBottomArea(root) }
         }
@@ -97,7 +99,9 @@ class HideBottomTabsHook(
 
     private fun scan(view: View) {
         // 先检查 view 自身是否命中 spec
-        if (specs.any { it.matches(view) }) {
+        val matchedSpec = specs.firstOrNull { it.matches(view) }
+        if (matchedSpec != null) {
+            Log.d(TAG, "[$packageName] ★ HIT ★ ${view.javaClass.simpleName} bounds=${formatBounds(view)} desc=${view.contentDescription} spec=${matchedSpec.javaClass.simpleName}")
             applyHide(view)
             return
         }
@@ -109,6 +113,9 @@ class HideBottomTabsHook(
             }
         }
     }
+
+    private fun formatBounds(view: View): String =
+        "[${view.left},${view.top}][${view.right},${view.bottom}]"
 
     private fun applyHide(view: View) {
         // 同一个 view 在一次扫描里重复命中,只处理一次

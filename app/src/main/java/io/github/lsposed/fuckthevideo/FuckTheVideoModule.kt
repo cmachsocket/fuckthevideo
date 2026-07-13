@@ -56,7 +56,7 @@ class FuckTheVideoModule : XposedModule() {
                 scanRootResourceId = "fl",  // ← entry name (不带 prefix),getIdentifier 只认 entry
                 specs = listOf(
                     TabSpec.ByDescendantOf(
-                        parentResourceName = "com.jingdong.app.mall:id/fl",
+                        parentResourceName = "fl",  // ← entry name 同上,getResourceEntryName 也只返 entry
                         descendantContentDesc = "逛",  // contains 匹配,抗改名
                     ),
                 ),
