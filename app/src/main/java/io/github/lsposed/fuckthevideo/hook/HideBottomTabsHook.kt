@@ -31,6 +31,12 @@ class HideBottomTabsHook(
         private const val TAG = "HideBottomTabs"
         /** 底部扫描深度 — 装饰视图最后几个 children 几乎一定包含 bottombar */
         private const val BOTTOM_SCAN_DEPTH = 4
+        /**
+         * 底部区域阈值(屏幕高度的分数)— 只有 top >= screenHeight * BOTTOM_FRACTION 才考虑藏。
+         * 0.67 = 只在屏幕下 1/3 区域藏 tab,顶层导航 / banner 就算 desc 命中也不会被误删。
+         * 调高(0.7 / 0.75)更严格,调低(0.5)更宽松。
+         */
+        private const val BOTTOM_FRACTION = 0.67
         /** setTag 的 key,标记本轮已处理过的 view,避免 fragment 重建时被反复打 */
         private const val VIEW_TAG_PROCESSED = 0x7f0a0001
     }
@@ -60,6 +66,7 @@ class HideBottomTabsHook(
 
     private fun doApply(activity: Activity?) {
         if (activity == null || activity.packageName != packageName) return
+        val screenHeight = activity.resources.displayMetrics.heightPixels
         if (scanRootResourceId != null) {
             val root = findViewByResourceName(activity, scanRootResourceId)
             if (root == null) {
@@ -68,12 +75,14 @@ class HideBottomTabsHook(
                 return
             }
             Log.d(TAG, "[$packageName] entry locked to ${root.javaClass.simpleName} id=$scanRootResourceId")
-            scan(root)
-            root.post { scan(root) }
+            val hid = scan(root, screenHeight)
+            // 第一轮没藏到才 post 重扫 — 处理 fragment 异步 inflate。
+            // 藏到了就不用再扫,省一半 + 避免对 JD NavigationGroup 多一次 layout pass 触发 NPE。
+            if (!hid) root.post { scan(root, screenHeight) }
         } else {
             val root = activity.window?.decorView ?: return
-            scanBottomArea(root)
-            root.post { scanBottomArea(root) }
+            val hid = scanBottomArea(root, screenHeight)
+            if (!hid) root.post { scanBottomArea(root, screenHeight) }
         }
     }
 
@@ -87,31 +96,54 @@ class HideBottomTabsHook(
      * 避免对整个 decorView 树做 DFS — 京东/淘宝的 decorView 动辄
      * 上千节点,扫一遍体感明显卡顿。底部 tab 一般在最末 1-3 个 children。
      */
-    private fun scanBottomArea(root: View) {
-        val parent = root as? ViewGroup ?: return
+    private fun scanBottomArea(root: View, screenHeight: Int): Boolean {
+        val parent = root as? ViewGroup ?: return false
         val n = parent.childCount
-        if (n == 0) return
+        if (n == 0) return false
         val from = maxOf(0, n - BOTTOM_SCAN_DEPTH)
         for (i in (n - 1) downTo from) {
-            scan(parent.getChildAt(i))
+            val child = parent.getChildAt(i) ?: continue
+            if (scan(child, screenHeight)) return true
         }
+        return false
     }
 
-    private fun scan(view: View) {
+    /**
+     * DFS 扫描整个子树。
+     *
+     * 关键点:
+     * 1. 用 `while (i < view.childCount)` 而不是 `for (i in 0 until view.childCount)`。
+     *    后者会把 childCount 缓存到寄存器,applyHide(REMOVE)改了 childCount 后
+     *    `view.getChildAt(oldCount-1)` 会返回 null → scan(null) → NPE → JD NavigationGroup 卡死。
+     * 2. 用 BOTTOM_FRACTION 过滤 — 京东顶部 NavigationButton(类 banner、推荐入口)
+     *    的内部 desc 也含"逛",y=53 在屏幕顶部,不能藏。只藏底部 1/3 才安全,
+     *    否则用户在非首页(逛发现页、逛店铺页)正常浏览的 view 会被误删。
+     */
+    private fun scan(view: View, screenHeight: Int): Boolean {
         // 先检查 view 自身是否命中 spec
         val matchedSpec = specs.firstOrNull { it.matches(view) }
         if (matchedSpec != null) {
+            // 底部区域过滤:必须在屏幕下 1/3。京东顶部 NavigationButton(banner、入口位)
+            // 内部 desc 也含 "逛"/"消息" 等关键字,会被 desc-based spec 误命中 →
+            // bounds 过滤是最后一道防线。
+            if (view.top < screenHeight * BOTTOM_FRACTION) {
+                Log.d(TAG, "[$packageName] ★ SKIP TOP ★ ${view.javaClass.simpleName} bounds=${formatBounds(view)} desc=${view.contentDescription} (top=${view.top} < ${screenHeight * BOTTOM_FRACTION})")
+                return false
+            }
             Log.d(TAG, "[$packageName] ★ HIT ★ ${view.javaClass.simpleName} bounds=${formatBounds(view)} desc=${view.contentDescription} spec=${matchedSpec.javaClass.simpleName}")
             applyHide(view)
-            return
+            return true
         }
-        // ViewGroup 还要递归(京东 BY_DESC 的目标在 inner,BY_PARENT 在 outer 兄弟)
+        // ViewGroup 还要递归(京东 BYDescendantOf 目标在 inner,BY_PARENT 在 outer 兄弟)
         if (view is ViewGroup) {
-            // 没命中自身,继续 children — 但不重复扫这个 group(已经检过自己)
-            for (i in 0 until view.childCount) {
-                scan(view.getChildAt(i))
+            var i = 0
+            while (i < view.childCount) {
+                val child = view.getChildAt(i) ?: break
+                if (scan(child, screenHeight)) return true
+                i++
             }
         }
+        return false
     }
 
     private fun formatBounds(view: View): String =
