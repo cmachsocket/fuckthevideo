@@ -73,8 +73,11 @@ class HideBottomTabsHook(
         try {
             Log.i(TAG, "[$packageName] apply() installing hook on ${onAttachedToWindow}")
             module.hook(onAttachedToWindow).intercept { chain ->
+                val obj = chain.thisObject
+                // 看 hook 触发没,以及 thisObject 是啥
+                Log.d(TAG, "[$packageName] onAttachedToWindow fired, thisObject=${obj?.javaClass?.name}")
                 try {
-                    doApplyAttached(chain.thisObject as? View)
+                    doApplyAttached(obj as? View)
                 } catch (t: Throwable) {
                     Log.e(TAG, "[$packageName] onAttachedToWindow hook crashed", t)
                 }
