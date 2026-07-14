@@ -68,17 +68,36 @@ class HideBottomTabsHook(
         if (activity == null || activity.packageName != packageName) return
         val screenHeight = activity.resources.displayMetrics.heightPixels
         if (scanRootResourceId != null) {
-            val root = findViewByResourceName(activity, scanRootResourceId)
-            if (root == null) {
+            val roots = findAllViewsByResourceName(activity, scanRootResourceId)
+            if (roots.isEmpty()) {
                 // id 没找到 — 这活动不是带 id/fl 的页面,跳过
                 Log.d(TAG, "[$packageName] scanRootResourceId=$scanRootResourceId not found in ${activity.javaClass.simpleName}, skip")
                 return
             }
-            Log.d(TAG, "[$packageName] entry locked to ${root.javaClass.simpleName} id=$scanRootResourceId")
-            val hid = scan(root, screenHeight)
+            // 多个同名 id root(京东 App 升级后顶部 banner NavigationGroup 也叫 id/fl,
+            // 跟底部 tab LinearLayout 同名),按 top 倒序扫:底部那个先命中。
+            // SKIP TOP 过滤会在顶部 NavigationButton 上 false,然后 fallthrough 到
+            // 下一个 sibling;倒序保证底部优先 — 找到就 break,省一次多余 scan。
+            val sortedRoots = roots.sortedByDescending { it.top }
+            Log.d(TAG, "[$packageName] found ${roots.size} id=$scanRootResourceId roots: " +
+                sortedRoots.joinToString { "${it.javaClass.simpleName}@${formatBounds(it)}" })
+            var hid = false
+            for (root in sortedRoots) {
+                if (scan(root, screenHeight)) {
+                    hid = true
+                    break
+                }
+            }
             // 第一轮没藏到才 post 重扫 — 处理 fragment 异步 inflate。
             // 藏到了就不用再扫,省一半 + 避免对 JD NavigationGroup 多一次 layout pass 触发 NPE。
-            if (!hid) root.post { scan(root, screenHeight) }
+            if (!hid) {
+                val firstRoot = sortedRoots.first()
+                firstRoot.post {
+                    for (root in sortedRoots) {
+                        if (scan(root, screenHeight)) break
+                    }
+                }
+            }
         } else {
             val root = activity.window?.decorView ?: return
             val hid = scanBottomArea(root, screenHeight)
@@ -89,6 +108,38 @@ class HideBottomTabsHook(
     private fun findViewByResourceName(activity: Activity, entryName: String): View? {
         val resId = activity.resources.getIdentifier(entryName, "id", packageName)
         return if (resId != 0) activity.findViewById(resId) else null
+    }
+
+    /**
+     * 找所有 entry name 相同的 view。
+     *
+     * 为什么不用 `activity.findViewById(resId)`:京东 App 升级后,顶部 banner 的
+     * NavigationGroup 现在也叫 `id/fl`,跟底部 tab 的 LinearLayout id 重名。
+     * `findViewById` 返第一个 inflate 进去的(顶部 banner),scan 在顶部跑就永远
+     * 摸不到底部 tab — 因为顶部"逛"被 SKIP TOP 过滤掉,顶部 NavigationGroup
+     * 又不包含底部 tab(它们是两棵独立的 view tree 子树)。
+     *
+     * 这里 DFS 整棵 decorView,把所有 id=fl 的 view 都收集起来,doApply 按 top
+     * 倒序后挨个 scan。decorView 一般上千节点,但 id=fl 节点少(京东目前 2 个),
+     * DFS 总开销远小于 scan 一棵无关子树。
+     */
+    private fun findAllViewsByResourceName(activity: Activity, entryName: String): List<View> {
+        val resId = activity.resources.getIdentifier(entryName, "id", packageName)
+        if (resId == 0) return emptyList()
+        val root = activity.window?.decorView ?: return emptyList()
+        val out = mutableListOf<View>()
+        collectById(root, resId, out)
+        return out
+    }
+
+    private fun collectById(view: View, targetId: Int, out: MutableList<View>) {
+        if (view.id == targetId) out.add(view)
+        if (view is ViewGroup) {
+            for (i in 0 until view.childCount) {
+                val child = view.getChildAt(i) ?: continue
+                collectById(child, targetId, out)
+            }
+        }
     }
 
     /**
