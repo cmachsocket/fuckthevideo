@@ -41,28 +41,85 @@ class HideBottomTabsHook(
         private const val VIEW_TAG_PROCESSED = 0x7f0a0001
     }
 
-    private val onResume: Method by lazy {
-        Activity::class.java.getDeclaredMethod("onResume")
+    /**
+     * Hook 时机改用 `View.onAttachedToWindow` 而不是 `Activity.onResume`。
+     *
+     * 为什么不用 onResume:
+     * 京东 App 升级后加了 libjdhook.so(基于 shadowhook 1.1.1),在 native 层
+     * inline hook 了 Activity.onResume 的 vtable entry — LSPosed 的 method
+     * handle hook 在 native vtable 层面被绕过,扫描完全不被调用。
+     * 淘宝也可能用了同类机制(shadowhook / YAHFA / Epic)。
+     *
+     * 为什么 onAttachedToWindow work:
+     * - 这是 View 级别的 hook,在 view 被加入 window 时触发
+     * - 京东淘宝的 native hook 框架一般不动这里(它们的目标是 Activity 生命周期 / sendSignal)
+     * - 底部 tab 的 root 必然要 onAttachedToWindow 一次才能显示
+     * - SKIP TOP 过滤(top < BOTTOM_FRACTION 屏幕高度)能快速剪枝,
+     *   顶部 banner 的 NavigationButton 不会触发 scan root 的逻辑
+     *
+     * 频率问题:每个 view add 都会触发,但只对京东/淘宝/拼多多生效(scope 限制),
+     * SKIP TOP 过滤后绝大多数 view 立即 return false,实际开销可忽略。
+     */
+    private val onAttachedToWindow: Method by lazy {
+        View::class.java.getDeclaredMethod("onAttachedToWindow")
     }
 
     /**
-     * 只装一个 [Activity.onResume] hook。
-     * 老 Xposed 时代 (9dd2b23 MainHook.java) 也是这个时机。
-     * onCreate 阶段 view tree 还没 layout,不该 scan。onResume 之后
-     * 一定 laid out,所以这是唯一靠谱的入口。
+     * 装一个 [View.onAttachedToWindow] hook。
+     *
+     * hook 内部任何异常都不能 kill 宿主 App — 吞了,只 log。
      */
     fun apply() {
-        module.hook(onResume).intercept { chain ->
-            chain.proceed()
-            // hook 内部任何异常都不能 kill 宿主 App — 吞了,只 log
+        module.hook(onAttachedToWindow).intercept { chain ->
             try {
-                doApply(chain.thisObject as? Activity)
+                doApplyAttached(chain.thisObject as? View)
             } catch (t: Throwable) {
-                Log.e(TAG, "[$packageName] doApply crashed", t)
+                Log.e(TAG, "[$packageName] onAttachedToWindow hook crashed", t)
             }
             null
         }
     }
+
+    /**
+     * onAttachedToWindow 入口:view 已经在 window tree 里。
+     *
+     * 因为这个 hook 频繁触发(每个 view add 都一次),不能像 doApply 那样拿
+     * Activity + screenHeight 然后扫整棵树。换策略:每次触发只判断**自己**
+     * 是不是要藏的目标,藏了就 return 不递归。
+     *
+     * 边界情况:
+     * - 命中后 view.setTag(VIEW_TAG_PROCESSED) 防 fragment 重建时重复打
+     * - target 一定是某个具体节点(FrameLayout/View),不是 root
+     */
+    private fun doApplyAttached(view: View?) {
+        if (view == null) return
+        // 已处理过的 view 直接跳过 — 防止 fragment 重建时重复 hide
+        if (view.getTag(VIEW_TAG_PROCESSED) == true) return
+
+        val matchedSpec = specs.firstOrNull { it.matches(view) } ?: return
+        // SKIP TOP 过滤:top 太靠上说明是 banner/入口位,不是底部 tab
+        val screenHeight = screenHeightCache ?: run {
+            // 从 view 自身拿到所属 window 的 display height
+            val h = runCatching {
+                val wm = view.context.getSystemService(android.content.Context.WINDOW_SERVICE)
+                    as? android.view.WindowManager
+                wm?.currentWindowMetrics?.bounds?.height()
+                    ?: view.resources.displayMetrics.heightPixels
+            }.getOrNull() ?: return
+            screenHeightCache = h
+            h
+        }
+        if (view.top < screenHeight * BOTTOM_FRACTION) {
+            // 只对真正命中过底部 tab 的 view 打 SKIP TOP log,顶部 banner 一票否决,避免日志洪水
+            Log.d(TAG, "[$packageName] ★ SKIP TOP ★ ${view.javaClass.simpleName} bounds=[${view.left},${view.top}][${view.right},${view.bottom}] desc=${view.contentDescription}")
+            return
+        }
+        Log.d(TAG, "[$packageName] ★ HIT ★ ${view.javaClass.simpleName} bounds=[${view.left},${view.top}][${view.right},${view.bottom}] desc=${view.contentDescription} spec=${matchedSpec.javaClass.simpleName}")
+        applyHide(view)
+    }
+
+    @Volatile
+    private var screenHeightCache: Int? = null
 
     private fun doApply(activity: Activity?) {
         if (activity == null || activity.packageName != packageName) return
