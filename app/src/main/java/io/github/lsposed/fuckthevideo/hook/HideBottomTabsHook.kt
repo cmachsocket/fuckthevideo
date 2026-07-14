@@ -70,13 +70,19 @@ class HideBottomTabsHook(
      * hook 内部任何异常都不能 kill 宿主 App — 吞了,只 log。
      */
     fun apply() {
-        module.hook(onAttachedToWindow).intercept { chain ->
-            try {
-                doApplyAttached(chain.thisObject as? View)
-            } catch (t: Throwable) {
-                Log.e(TAG, "[$packageName] onAttachedToWindow hook crashed", t)
+        try {
+            Log.i(TAG, "[$packageName] apply() installing hook on ${onAttachedToWindow}")
+            module.hook(onAttachedToWindow).intercept { chain ->
+                try {
+                    doApplyAttached(chain.thisObject as? View)
+                } catch (t: Throwable) {
+                    Log.e(TAG, "[$packageName] onAttachedToWindow hook crashed", t)
+                }
+                null
             }
-            null
+            Log.i(TAG, "[$packageName] apply() hook installed")
+        } catch (t: Throwable) {
+            Log.e(TAG, "[$packageName] module.hook() crashed", t)
         }
     }
 
