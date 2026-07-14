@@ -105,6 +105,19 @@ class HideBottomTabsHook(
         // 已处理过的 view 直接跳过 — 防止 fragment 重建时重复 hide
         if (view.getTag(VIEW_TAG_PROCESSED) == true) return
 
+        // 关键:京东等 App 在 onAttachedToWindow 时 view 的 contentDescription 还没设,
+        // 是 attach 后某个时间点才设置(异步 inflate / 数据绑定)。dump 能看到是因为
+        // dump 时已经过了几百 ms。
+        // 解法:post 到下一帧再检查,那时 desc/id 等属性都已设好。
+        view.post {
+            // 可能 view 在 post 期间被 remove 了
+            if (view.parent == null) return@post
+            if (view.getTag(VIEW_TAG_PROCESSED) == true) return@post
+            checkAndHide(view)
+        }
+    }
+
+    private fun checkAndHide(view: View) {
         // Debug: 报告任何含'逛'的 view 或 parent.id=fl
         val desc = view.contentDescription?.toString() ?: ""
         val parentIdName = if (view.parent is View) {
