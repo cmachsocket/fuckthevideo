@@ -105,6 +105,15 @@ class HideBottomTabsHook(
         // 已处理过的 view 直接跳过 — 防止 fragment 重建时重复 hide
         if (view.getTag(VIEW_TAG_PROCESSED) == true) return
 
+        // Debug: 报告任何含'逛'的 view 或 parent.id=fl
+        val desc = view.contentDescription?.toString() ?: ""
+        val parentIdName = if (view.parent is View) {
+            runCatching { (view.parent as View).resources.getResourceEntryName((view.parent as View).id) }.getOrNull()
+        } else null
+        if (desc.contains("逛") || parentIdName == scanRootResourceId) {
+            Log.d(TAG, "[$packageName] candidate view: cls=${view.javaClass.simpleName} desc=$desc bounds=[${view.left},${view.top}][${view.right},${view.bottom}] parentId=$parentIdName")
+        }
+
         val matchedSpec = specs.firstOrNull { it.matches(view) } ?: return
         // SKIP TOP 过滤:top 太靠上说明是 banner/入口位,不是底部 tab
         val screenHeight = screenHeightCache ?: run {
