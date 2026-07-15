@@ -11,8 +11,8 @@ android {
         applicationId = "io.github.lsposed.fuckthevideo"
         minSdk = libs.versions.minSdk.get().toInt()
         targetSdk = libs.versions.targetSdk.get().toInt()
-        versionCode = 10
-        versionName = "0.3.5"
+        versionCode = 12
+        versionName = "0.3.7"
     }
 
     buildTypes {

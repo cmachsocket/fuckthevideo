@@ -178,6 +178,7 @@ class FuckTheVideoModule : XposedModule() {
         // label field directly.
         when (target.pkg) {
             "com.jingdong.app.mall" -> installJDNavigationGroupHide(appClassLoader)
+            "com.xunmeng.pinduoduo" -> installPDDTabLayoutHide(appClassLoader)
         }
     }
 
@@ -258,6 +259,148 @@ class FuckTheVideoModule : XposedModule() {
                 log(Log.DEBUG, "hideJDTabs: keep ${className.substringAfterLast('.')} label=$label")
             }
         }
+    }
+
+    /**
+     * PDD-specific: PDD uses a forked Material TabLayout at
+     * com.xunmeng.android_ui.tablayout.TabLayout (HorizontalScrollView)
+     * with a TabView inner class (LinearLayout) that has PUBLIC field
+     * `b: TextView` (the tab title). The bottom tab in PDD's main
+     * page is a TabLayout, and the "多多视频" tab cell is a TabView
+     * whose `b.text` is "多多视频".
+     *
+     * Hook TabLayout's public constructors. After the TabLayout is
+     * built, post a delayed scan: walk down from the TabLayout into
+     * its SlidingTabStrip (also a TabLayout inner class) and check
+     * each TabView's `b` TextView text. If it contains "多多视频", set
+     * the TabView visibility to GONE.
+     *
+     * Verified in PDD 7+ decompilation (classes.dex):
+     *   com.xunmeng.android_ui.tablayout.TabLayout extends HorizontalScrollView
+     *   TabLayout$TabView extends LinearLayout
+     *     field b: TextView PUBLIC (tab title)
+     *   TabLayout$SlidingTabStrip extends LinearLayout (internal)
+     *
+     * PDD's main process and the `:titan` secondary process are
+     * separate VMs. The bottom tab we want is in the MAIN process's
+     * main activity (the LinearLayout id=fl we see in uiautomator
+     * dump is actually the SlidingTabStrip of the TabLayout, or
+     * something equivalent), so the main-process hook should reach
+     * it. (Earlier evidence that PDD's tab was in :titan was based
+     * on the GENERIC scan finding nothing — but the app-specific
+     * constructor hook fires earlier, before the tab is removed
+     * from view, so we get a chance to hide it.)
+     */
+    /**
+     * PDD-specific (revised again). PDD's bottom tab on the main
+     * page is rendered by [MainFrameContainerView] (classes6.dex).
+     * That class extends RelativeLayout, has 4 PUBLIC constructors,
+     * and is the visual container for the bottom tab bar. Its
+     * children include a LinearLayout that contains the 5
+     * RelativeLayout tab cells (each with a content-desc like
+     * "首页" / "多多视频" / "领消费券" / "聊天" / "个人中心").
+     *
+     * Earlier attempts:
+     *   - Hooking `TabLayout` constructor: caught the TOP banner's
+     *     HomeTabLayout (24-category scroll bar), not the bottom bar.
+     *   - Hooking `TabBarViewTrackableManager` constructor: that
+     *     class's `dataContainer` field is also the TOP banner
+     *     SlidingTabStrip, not the bottom bar.
+     *
+     * attach path: hook every PUBLIC constructor of
+     * MainFrameContainerView. After the constructor returns, post
+     * delayed scans that DFS the resulting view for any child whose
+     * contentDescription contains "多多视频" and GONE that child.
+     */
+    private fun installPDDTabLayoutHide(classLoader: ClassLoader) {
+        val viewClass = runCatching {
+            Class.forName(
+                "com.xunmeng.pinduoduo.ui_home_activity.widget.MainFrameContainerView",
+                true,
+                classLoader,
+            )
+        }.getOrNull() ?: run {
+            log(Log.WARN, "installPDDTabLayoutHide: MainFrameContainerView class not found in classLoader")
+            return
+        }
+        log(Log.INFO, "installPDDTabLayoutHide: found ${viewClass.name}")
+
+        for (ctor in viewClass.declaredConstructors) {
+            runCatching {
+                hook(ctor).intercept { chain ->
+                    chain.proceed()
+                    val view = chain.thisObject as? android.view.View ?: return@intercept null
+                    log(Log.INFO, "installPDDTabLayoutHide: ctor fired, scheduling hide scan")
+                    val handler = Handler(Looper.getMainLooper())
+                    for (delayMs in listOf(300L, 1500L, 5000L)) {
+                        handler.postDelayed({ hidePDDTabs(view) }, delayMs)
+                    }
+                    null
+                }
+            }.onFailure { t ->
+                log(Log.WARN, "installPDDTabLayoutHide: ctor hook failed", t)
+            }
+        }
+    }
+
+    private fun hidePDDTabs(tabLayout: android.view.View) {
+        if (tabLayout !is android.view.ViewGroup) {
+            log(Log.WARN, "hidePDDTabs: tabLayout is not ViewGroup: ${tabLayout.javaClass.name}")
+            return
+        }
+        val targetKeywords = listOf("多多视频")
+        log(Log.INFO, "hidePDDTabs: enter, tabLayout=${tabLayout.javaClass.simpleName} childCount=${tabLayout.childCount}")
+        // PDD's actual view tree (from uiautomator dump on JD 13+ PDD 7+):
+        //   TabLayout extends HorizontalScrollView
+        //     SlidingTabStrip extends LinearLayout (one level down)
+        //       TabView extends LinearLayout
+        //         RelativeLayout (inflated from layout XML, this is the
+        //           actual visible "tab cell" container)
+        //           ImageView  - icon
+        //           TextView   - title text ("首页" / "多多视频" / etc.)
+        // We want to GONE the RelativeLayout (the visible tab cell), not
+        // the inner TextView/ImageView. The dump's `content-desc` is on
+        // the RelativeLayout. We find each RelativeLayout under
+        // SlidingTabStrip that contains a TextView whose text matches
+        // our keywords, then GONE the RelativeLayout.
+        for (i in 0 until tabLayout.childCount) {
+            val strip = runCatching { tabLayout.getChildAt(i) }.getOrNull() ?: continue
+            if (strip !is android.view.ViewGroup) continue
+            log(Log.INFO, "hidePDDTabs: strip[$i]=${strip.javaClass.name} childCount=${strip.childCount}")
+            for (j in 0 until strip.childCount) {
+                val tabView = runCatching { strip.getChildAt(j) }.getOrNull() ?: continue
+                if (tabView !is android.view.ViewGroup) continue
+                // Find the title text within this tab cell by DFS
+                val title = findFirstTextIn(tabView)
+                log(Log.INFO, "hidePDDTabs: tabCell[$j]=${tabView.javaClass.simpleName} text=$title")
+                if (title != null && targetKeywords.any { title.contains(it) }) {
+                    log(Log.INFO, "hidePDDTabs: HIT tab cell text=$title -> GONE")
+                    tabView.visibility = android.view.View.GONE
+                    val lp = tabView.layoutParams
+                    if (lp != null) { lp.width = 0; lp.height = 0; tabView.layoutParams = lp }
+                    tabView.requestLayout()
+                }
+            }
+        }
+    }
+
+    /**
+     * DFS a view group and return the first non-empty TextView text
+     * found. Used by [hidePDDTabs] to identify tab cells by their title.
+     */
+    private fun findFirstTextIn(group: android.view.ViewGroup): String? {
+        for (i in 0 until group.childCount) {
+            val child = runCatching { group.getChildAt(i) }.getOrNull() ?: continue
+            if (child is android.widget.TextView) {
+                val t = child.text?.toString()?.trim()
+                if (!t.isNullOrEmpty()) return t
+            }
+            if (child is android.view.ViewGroup) {
+                val nested = findFirstTextIn(child)
+                if (nested != null) return nested
+            }
+        }
+        return null
     }
 
     private fun scheduleScans(hook: HideBottomTabsHook) {
@@ -363,8 +506,15 @@ class FuckTheVideoModule : XposedModule() {
     // ---- helpers -----------------------------------------------------------
 
     /**
-     * Mirror of the example's log() helper. Centralises logcat emission so
-     * we can swap the sink (e.g. file-only in production) in one place.
+     * Mirror of the example's log() helper. Writes to logcat only.
+     * The file sink was removed because the host app process doesn't
+     * have write permission to /data/data/<module-package>/, and
+     * finding the right host cache path at log() time is fragile
+     * (we're inside the host process, not the module app).
+     *
+     * If logd is dropping our output (per-PID quota of 300 lines
+     * filled by host app verbosity), use `adb logcat -v threadtime` to
+     * see what survived.
      */
     private fun log(priority: Int, msg: String, t: Throwable? = null) {
         if (t != null) {
