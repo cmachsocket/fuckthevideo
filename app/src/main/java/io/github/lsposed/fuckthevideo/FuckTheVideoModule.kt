@@ -138,18 +138,12 @@ class FuckTheVideoModule : XposedModule() {
             return
         }
 
-        installForTarget(target)
+        installForTarget(target, param.classLoader)
     }
 
     // ---- per-target install -----------------------------------------------
 
-    private fun installForTarget(target: Target) {
-        // The host app's classloader is param.classLoader in onPackageReady.
-        // We don't currently use it because all hooks target system classes
-        // (View, ViewGroup, ActivityThread). It's passed here so future
-        // app-specific class hooks (e.g. com.jingdong.app.mall.SomeClass)
-        // can call Class.forName(name, true, appClassLoader) without
-        // changing the call site again.
+    private fun installForTarget(target: Target, appClassLoader: ClassLoader) {
         log(Log.INFO, "hooking ${target.pkg} specs=${target.specs} strategy=${target.strategy}")
         val hook = HideBottomTabsHook(
             specs = target.specs,
@@ -173,6 +167,96 @@ class FuckTheVideoModule : XposedModule() {
             // sync scan vs 1661-view uiautomator dump taken 12s later for
             // one app).
             scheduleScans(hook)
+        }
+        // App-specific tab hooks. These use param.classLoader to load
+        // classes from the host app. They run in addition to the
+        // generic HideBottomTabsHook paths because the bottom tab in
+        // modern apps is a Java view (e.g. JD's NavigationGroup extends
+        // LinearLayout) but its contentDescription is set in XML so the
+        // generic setContentDescription hook never fires. The app-
+        // specific hooks target a known tab cell class and reflect on its
+        // label field directly.
+        when (target.pkg) {
+            "com.jingdong.app.mall" -> installJDNavigationGroupHide(appClassLoader)
+        }
+    }
+
+    /**
+     * JD-specific: hook every NavigationGroup constructor. When a
+     * NavigationGroup is created, schedule a post on the main thread
+     * that walks its children, looks for NavigationButton with label
+     * "逛" (this week's A/B variant: "逛2元", "逛魅族" etc.) and sets
+     * its visibility to GONE. We hide one specific tab cell instead of
+     * the whole NavigationGroup so the rest of the bar reflows
+     * correctly.
+     *
+     * Verified in JD 13+ decompilation (classes2.dex):
+     *   com.jingdong.common.unification.navigationbar.newbar.NavigationGroup
+     *     extends LinearLayout implements OnClickListener
+     *     field `buttons: List<NavigationButton>` — all tab cells
+     *     PRIVATE method `initButtons(INavigationShow, Activity)` — populate buttons
+     *   com.jingdong.common.unification.navigationbar.newbar.NavigationButton
+     *     extends FrameLayout
+     *     field `label: String` PRIVATE — the tab's text
+     */
+    private fun installJDNavigationGroupHide(classLoader: ClassLoader) {
+        val navGroupClass = runCatching {
+            Class.forName(
+                "com.jingdong.common.unification.navigationbar.newbar.NavigationGroup",
+                true,
+                classLoader,
+            )
+        }.getOrNull() ?: run {
+            log(Log.WARN, "installJDNavigationGroupHide: NavigationGroup class not found in classLoader")
+            return
+        }
+        log(Log.INFO, "installJDNavigationGroupHide: found ${navGroupClass.name}")
+
+        // Hook every public constructor. After the constructor returns
+        // the ViewGroup exists but its children (NavigationButton) may
+        // not be inflated yet — `initButtons` runs later from
+        // JDNavigationFragment.onViewCreated. We post a delayed check
+        // so the view tree is fully laid out before we touch it.
+        for (ctor in navGroupClass.declaredConstructors) {
+            runCatching {
+                hook(ctor).intercept { chain ->
+                    chain.proceed()
+                    val view = chain.thisObject as? android.view.View ?: return@intercept null
+                    val handler = Handler(Looper.getMainLooper())
+                    // Multiple delays because tab cells can be re-added
+                    // after orientation / config change / push tab swap.
+                    for (delayMs in listOf(300L, 1500L, 5000L)) {
+                        handler.postDelayed({ hideJDTabs(view) }, delayMs)
+                    }
+                    null
+                }
+            }.onFailure { t ->
+                log(Log.WARN, "installJDNavigationGroupHide: ctor hook failed", t)
+            }
+        }
+    }
+
+    private fun hideJDTabs(navGroup: android.view.View) {
+        if (navGroup !is android.view.ViewGroup) return
+        val targetKeywords = listOf("逛")
+        for (i in 0 until navGroup.childCount) {
+            val child = runCatching { navGroup.getChildAt(i) }.getOrNull() ?: continue
+            val className = child.javaClass.name
+            if (!className.contains("NavigationButton")) continue
+            val label = runCatching {
+                val field = child.javaClass.getDeclaredField("label")
+                field.isAccessible = true
+                field.get(child) as? String
+            }.getOrNull() ?: continue
+            if (targetKeywords.any { label.contains(it) }) {
+                log(Log.INFO, "hideJDTabs: HIT ${className.substringAfterLast('.')} label=$label -> GONE")
+                child.visibility = android.view.View.GONE
+                val lp = child.layoutParams
+                if (lp != null) { lp.width = 0; lp.height = 0; child.layoutParams = lp }
+                child.requestLayout()
+            } else {
+                log(Log.DEBUG, "hideJDTabs: keep ${className.substringAfterLast('.')} label=$label")
+            }
         }
     }
 
