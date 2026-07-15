@@ -2,8 +2,13 @@ package io.github.lsposed.fuckthevideo
 
 import android.app.Activity
 import android.app.Application
+import android.os.Build
+import android.os.Handler
+import android.os.Looper
 import android.util.Log
 import io.github.libxposed.api.XposedModule
+import io.github.libxposed.api.XposedModuleInterface.ModuleLoadedParam
+import io.github.libxposed.api.XposedModuleInterface.PackageLoadedParam
 import io.github.libxposed.api.XposedModuleInterface.PackageReadyParam
 import io.github.lsposed.fuckthevideo.hook.HideBottomTabsHook
 import io.github.lsposed.fuckthevideo.hook.HideStrategy
@@ -50,7 +55,7 @@ import io.github.lsposed.fuckthevideo.hook.TabSpec
 class FuckTheVideoModule : XposedModule() {
 
     companion object {
-        private const val TAG = "FuckTheVideo"
+        const val TAG = "FuckTheVideo"
         private const val SELF_PKG = "io.github.lsposed.fuckthevideo"
 
         private data class Target(
@@ -84,18 +89,68 @@ class FuckTheVideoModule : XposedModule() {
         )
     }
 
-    override fun onPackageReady(param: PackageReadyParam) {
-        Log.i(TAG, "onPackageReady pkg=${param.packageName} isFirstPackage=${param.isFirstPackage}")
-        if (!param.isFirstPackage) return
-        if (param.packageName == SELF_PKG) return
+    // ---- libxposed lifecycle ----------------------------------------------
 
+    override fun onModuleLoaded(param: ModuleLoadedParam) {
+        log(Log.INFO, "onModuleLoaded: ${param.processName}")
+        log(Log.INFO, "framework: $frameworkName($frameworkVersionCode) API $apiVersion")
+
+        val hasProp: (Long) -> Boolean = { prop -> frameworkProperties and prop != 0L }
+        log(Log.INFO, "system supported: " + hasProp(PROP_CAP_SYSTEM))
+        log(Log.INFO, "remote supported: " + hasProp(PROP_CAP_REMOTE))
+        log(Log.INFO, "api protection: " + hasProp(PROP_RT_API_PROTECTION))
+    }
+
+    @Suppress("UNUSED_PARAMETER")
+    override fun onPackageLoaded(param: PackageLoadedParam) {
+        // Early hook point: classloader is available but the app may not
+        // have onCreate'd yet. We don't install any hook here because all
+        // our hooks target system classes (View, ViewGroup, ActivityThread)
+        // which are always available regardless of app classloader state.
+        // Kept as a no-op log so we can see in logcat that onPackageReady
+        // is preceded by onPackageLoaded. No @RequiresApi guard — our
+        // minSdk is 27 and the framework version we test on is 16 (Q+),
+        // and the libxposed API only delivers this callback on Q+ anyway.
+        log(Log.INFO, "onPackageLoaded: ${param.packageName} classLoader=${param.defaultClassLoader}")
+    }
+
+    override fun onPackageReady(param: PackageReadyParam) {
+        log(Log.INFO, "onPackageReady: ${param.packageName} isFirst=${param.isFirstPackage} classLoader=${param.classLoader}")
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            log(Log.INFO, "app acf: ${param.appComponentFactory}")
+        }
+
+        if (param.packageName == SELF_PKG) return
         val target = TARGETS.firstOrNull { it.pkg == param.packageName }
         if (target == null) {
-            Log.d(TAG, "ignore ${param.packageName} (not in scope)")
+            log(Log.DEBUG, "ignore ${param.packageName} (not in scope)")
+            return
+        }
+        if (!param.isFirstPackage) {
+            // We only install in the main process. Secondary processes
+            // (e.g. JD privileged_dong_process0) don't host the bottom
+            // tab — it's in the main activity's view tree or rendered
+            // natively from the main process. The exception is PDD's
+            // :titan process, but we can't reach it via the host's
+            // classloader anyway; the main process hooks are kept as
+            // a best-effort.
+            log(Log.INFO, "skip non-first package ${param.packageName}")
             return
         }
 
-        Log.i(TAG, "hooking ${param.packageName} specs=${target.specs} strategy=${target.strategy}")
+        installForTarget(target)
+    }
+
+    // ---- per-target install -----------------------------------------------
+
+    private fun installForTarget(target: Target) {
+        // The host app's classloader is param.classLoader in onPackageReady.
+        // We don't currently use it because all hooks target system classes
+        // (View, ViewGroup, ActivityThread). It's passed here so future
+        // app-specific class hooks (e.g. com.jingdong.app.mall.SomeClass)
+        // can call Class.forName(name, true, appClassLoader) without
+        // changing the call site again.
+        log(Log.INFO, "hooking ${target.pkg} specs=${target.specs} strategy=${target.strategy}")
         val hook = HideBottomTabsHook(
             specs = target.specs,
             packageName = target.pkg,
@@ -103,32 +158,30 @@ class FuckTheVideoModule : XposedModule() {
         )
         val app = moduleContext()
         if (app != null) {
-            Log.i(TAG, "using ActivityLifecycleCallbacks")
+            log(Log.INFO, "using ActivityLifecycleCallbacks")
             hook.attachTo(app)
         } else {
-            Log.w(TAG, "ActivityLifecycleCallbacks unavailable, fallback to onResume hook + scheduled scan")
+            log(Log.WARN, "ActivityLifecycleCallbacks unavailable, fallback to onResume hook + scheduled scan")
             hook.attachViaOnResumeHook(this)
             // LSPosed's hook install is async and races with app activity
-            // startup. Splash → main transition can complete before our hook
-            // is even registered. Schedule scans at 1/3/5/10/20/30s that
-            // don't rely on hooks — they iterate the ActivityThread.mActivities
-            // map and scan whatever activity is currently visible. Long
-            // delays are needed because some apps inflate their bottom tab
-            // bar lazily (we observed 679-view sync scan vs 1661-view
-            // uiautomator dump taken 12s later for one app).
-            val handler = android.os.Handler(android.os.Looper.getMainLooper())
-            val runnable = Runnable { scheduledScan(hook) }
-            handler.postDelayed(runnable, 1000)
-            handler.postDelayed(runnable, 3000)
-            handler.postDelayed(runnable, 5000)
-            handler.postDelayed(runnable, 10000)
-            handler.postDelayed(runnable, 20000)
-            handler.postDelayed(runnable, 30000)
+            // startup. Splash → main transition can complete before our
+            // hook is even registered. Schedule scans at 1/3/5/10/20/30s
+            // that don't rely on hooks — they iterate
+            // ActivityThread.mActivities and scan whatever activity is
+            // currently visible. Long delays are needed because some apps
+            // inflate their bottom tab bar lazily (we observed 679-view
+            // sync scan vs 1661-view uiautomator dump taken 12s later for
+            // one app).
+            scheduleScans(hook)
         }
-        // attachTo 的 onActivityResumed 已经会调 attachLayoutScan；fallback 路径
-        // 在第一次 scheduledScan 找到 activity 时也会调。这里不再额外调
-        // attachLayoutScanOnFirstActivity —— mActivities 在 onPackageReady 时
-        // 总是空的，原方案扫不到任何东西。
+    }
+
+    private fun scheduleScans(hook: HideBottomTabsHook) {
+        val handler = Handler(Looper.getMainLooper())
+        val runnable = Runnable { scheduledScan(hook) }
+        for (delayMs in listOf(1000L, 3000L, 5000L, 10000L, 20000L, 30000L)) {
+            handler.postDelayed(runnable, delayMs)
+        }
     }
 
     /**
@@ -145,7 +198,7 @@ class FuckTheVideoModule : XposedModule() {
                 ?: return@runCatching
             mActivities.isAccessible = true
             val map = mActivities.get(currentAT) as? Map<*, *> ?: return@runCatching
-            Log.w(TAG, "scheduledScan: mActivities.size=${map.size}")
+            log(Log.WARN, "scheduledScan: mActivities.size=${map.size}")
             for ((_, record) in map) {
                 if (record == null) continue
                 val recordClass = record::class.java
@@ -162,13 +215,13 @@ class FuckTheVideoModule : XposedModule() {
                 }.getOrNull() ?: continue
                 val finishing = runCatching { activity.isFinishing }.getOrDefault(true)
                 val destroyed = runCatching { activity.isDestroyed }.getOrDefault(true)
-                Log.w(TAG, "scheduledScan: got activity=${activity.javaClass.simpleName} pkg=${activity.packageName} finishing=$finishing destroyed=$destroyed attached=${activity.window != null}")
+                log(Log.WARN, "scheduledScan: got activity=${activity.javaClass.simpleName} pkg=${activity.packageName} finishing=$finishing destroyed=$destroyed attached=${activity.window != null}")
                 if (activity.packageName == hook.packageName && !finishing && !destroyed) {
                     hook.runScheduledScan(activity)
                 }
             }
         }.onFailure { t ->
-            Log.w(TAG, "scheduledScan crashed: ${t.javaClass.simpleName}: ${t.message}")
+            log(Log.WARN, "scheduledScan crashed", t)
         }
     }
 
@@ -188,7 +241,7 @@ class FuckTheVideoModule : XposedModule() {
                 field.isAccessible = true
                 val app = field.get(null) as? Application
                 if (app != null && app.packageName != SELF_PKG) {
-                    Log.w(TAG, "moduleContext: got app via $name -> ${app.packageName}")
+                    log(Log.WARN, "moduleContext: got app via $name -> ${app.packageName}")
                     return app
                 }
             }
@@ -198,28 +251,42 @@ class FuckTheVideoModule : XposedModule() {
             val currentAT = runCatching {
                 threadClass.getMethod("currentActivityThread").invoke(null)
             }.getOrNull() ?: run {
-                Log.w(TAG, "moduleContext: no currentActivityThread method either")
+                log(Log.WARN, "moduleContext: no currentActivityThread method either")
                 return null
             }
-            Log.w(TAG, "moduleContext: got currentActivityThread=${currentAT.javaClass.simpleName}")
+            log(Log.WARN, "moduleContext: got currentActivityThread=${currentAT.javaClass.simpleName}")
             val currentApplication = runCatching {
                 val m = threadClass.getMethod("currentApplication")
                 m.isAccessible = true
                 m.invoke(currentAT)
             }.onFailure { t ->
-                Log.w(TAG, "moduleContext: currentApplication invoke failed: ${t.javaClass.simpleName}: ${t.message}")
+                log(Log.WARN, "moduleContext: currentApplication invoke failed", t)
             }.getOrNull()
-            Log.w(TAG, "moduleContext: currentApplication raw=${currentApplication?.javaClass?.simpleName}")
+            log(Log.WARN, "moduleContext: currentApplication raw=${currentApplication?.javaClass?.simpleName}")
             val app = currentApplication as? Application
             if (app != null && app.packageName != SELF_PKG) {
-                Log.w(TAG, "moduleContext: got app via currentApplication -> ${app.packageName}")
+                log(Log.WARN, "moduleContext: got app via currentApplication -> ${app.packageName}")
                 return app
             }
-            Log.w(TAG, "moduleContext: app is null or self, packageName=${app?.packageName}")
+            log(Log.WARN, "moduleContext: app is null or self, packageName=${app?.packageName}")
             null
         }.getOrElse { t ->
-            Log.w(TAG, "moduleContext crashed: ${t.javaClass.simpleName}: ${t.message}")
+            log(Log.WARN, "moduleContext crashed", t)
             null
+        }
+    }
+
+    // ---- helpers -----------------------------------------------------------
+
+    /**
+     * Mirror of the example's log() helper. Centralises logcat emission so
+     * we can swap the sink (e.g. file-only in production) in one place.
+     */
+    private fun log(priority: Int, msg: String, t: Throwable? = null) {
+        if (t != null) {
+            Log.println(priority, TAG, "$msg\n${Log.getStackTraceString(t)}")
+        } else {
+            Log.println(priority, TAG, msg)
         }
     }
 }
