@@ -13,6 +13,13 @@ import io.github.libxposed.api.XposedModule
 import java.io.File
 import java.lang.reflect.Method
 
+// Shared tag for marking a view as already-processed by the module.
+// Used by both HideBottomTabsHook (in its scan paths) and
+// FuckTheVideoModule (for app-specific tab cell hooks). Defined as
+// a top-level constant so both files can reference it directly
+// without going through a companion object.
+const val VIEW_TAG_PROCESSED: Int = 0x7f0a0001
+
 /**
  * Business hook: hide specified bottom tab nodes in target app main page.
  *
@@ -76,7 +83,6 @@ class HideBottomTabsHook(
     companion object {
         private const val TAG = "HideBottomTabs"
         private const val BOTTOM_FRACTION = 0.67
-        private const val VIEW_TAG_PROCESSED = 0x7f0a0001
     }
 
     // ---- attach paths ------------------------------------------------------

@@ -13,44 +13,56 @@ import io.github.libxposed.api.XposedModuleInterface.PackageReadyParam
 import io.github.lsposed.fuckthevideo.hook.HideBottomTabsHook
 import io.github.lsposed.fuckthevideo.hook.HideStrategy
 import io.github.lsposed.fuckthevideo.hook.TabSpec
+import io.github.lsposed.fuckthevideo.hook.VIEW_TAG_PROCESSED
 
 /**
  * Vector / libxposed module entry.
  *
  * Entry discovery: [app/src/main/resources/META-INF/xposed/java_init.list]
  *
- * Business goal: hide "video" tab in Taobao / JD / Pinduoduo main page bottom bar.
+ * Business goal: hide "video" tab in Taobao / JD / Pinduoduo main page
+ * bottom bar.
  *
- * Per-app strategy:
- * - Taobao: TabHost (legacy widget) — REMOVE crashes on next focus switch
- *   because TabHost holds internal references to its tab views. Use ZERO_SIZE.
- * - JD: NavigationGroup is absolute-positioned FrameLayout — GONE doesn't
- *   reflow siblings. Use REMOVE + scanRootResourceId="fl" to lock scan root.
- * - Pinduoduo: bottom tab LinearLayout with no stable id — use REMOVE + full
- *   tree DFS, bottom-region filter excludes top banner entries.
+ * Per-app attach (app-specific constructor hooks, added in v0.3.5+):
+ * - Taobao: hooks [com.taobao.tao.navigation.TBFragmentTabHost]
+ *   (extends android.widget.TabHost). ZERO_SIZE strategy (not REMOVE —
+ *   REMOVE breaks TabHost's internal mCurrentTab / mLastTab state on
+ *   next tab switch). DFS finds the TextView "视频" inside the
+ *   TabWidget and ZERO_SIZEs the surrounding
+ *   NavigationTabIndicatorView tab cell.
+ * - JD: hooks [com.jingdong.common.unification.navigationbar.newbar.NavigationGroup]
+ *   (extends LinearLayout). REMOVE strategy. Reflects on the
+ *   NavigationButton `label` field for "逛".
+ * - Pinduoduo: hooks [com.xunmeng.pinduoduo.ui_home_activity.widget.MainFrameContainerView]
+ *   (extends RelativeLayout). REMOVE strategy. DFS finds TextView
+ *   "多多视频" and GONE its parent ViewGroup.
  *
- * Two attach paths:
- * 1. Try ActivityLifecycleCallbacks (needs Application via static field
- *    reflection, which usually bypasses LSPosed's reflection check).
- * 2. Fall back to hooking Activity.onResume directly.
+ * In addition to the app-specific hooks, the generic
+ * [HideBottomTabsHook] paths (setContentDescription, scheduled scan,
+ * layout scan) also fire as a safety net. The setContentDescription
+ * match for "视频" / "逛" / "多多视频" also matches the same view that
+ * the app-specific hook handles — they converge.
  *
- * KNOWN LIMITATIONS (verified on OnePlus OP60EDL1, Android 16, JD 13+ /
- * PDD 7+ / Taobao latest as of 2026-07):
- * - JD bottom tab is native-rendered (TNViewGroup/TNImage/TNLottieView).
- *   The tab cells never enter the main process's Java View tree. None
- *   of the four attach paths in [HideBottomTabsHook] can reach them.
- * - PDD renders UI in a `:titan` secondary process. The main process
- *   decorView's view tree is empty in the bottom region, so the
- *   scheduled scan and the layout scan never find a match.
- * - Taobao: not yet verified end-to-end on this device; based on the
- *   same code paths, expect a similar situation as PDD.
+ * KNOWN LIMITATIONS (verified on OnePlus OP60EDL1, Android 16, ColorOS 16,
+ * JD 13+ / PDD 7+ / Taobao latest as of 2026-07-16):
+ * - Without app-specific hooks (i.e. the generic paths alone):
+ *   * JD bottom tab is native-rendered (TNViewGroup/TNImage) — Java view
+ *     tree has no tab cells in the bottom region.
+ *   * PDD renders UI in a `:titan` secondary process — main process
+ *     view tree is empty in the bottom region.
+ *   * Taobao's bottom tab is a NavigationTabIndicatorView inside
+ *     TBFragmentTabHost, BUT the generic setContentDescription hook
+ *     fires too early (top=0 in TabWidget's coord space, not yet
+ *     laid out at the bottom) and the defer-hide never triggers.
+ * - With app-specific constructor hooks installed:
+ *   * JD/PDD/TB all three are now hideable.
  *
- * The module's only reliable effect is correctly SKIPPING the top banner
- * entries (which have the same contentDescription as the bottom tab and
- * are set dynamically). It does NOT actually hide any bottom tab on
- * the three target apps as currently shipped. The hooks are kept in
- * place in case the app architecture changes (e.g. falls back to a
- * normal Java view hierarchy in an older version or via a config flag).
+ * Verified on device:
+ *   v0.3.5 (JD  : "逛" tab removed, 5→4 tabs)
+ *   v0.3.7 (PDD : "多多视频" tab removed, 5→4 tabs)
+ *   v0.3.8 (TB  : "视频" NavigationTabIndicatorView ZERO_SIZEd;
+ *                 dump confirms bounds [254,0][508,196] is the
+ *                 bottom tab cell — TBFragmentTabHost at [0,2604][1272,2800])
  */
 class FuckTheVideoModule : XposedModule() {
 
@@ -67,7 +79,7 @@ class FuckTheVideoModule : XposedModule() {
         private val TARGETS = listOf(
             Target(
                 pkg = "com.taobao.taobao",
-                strategy = HideStrategy.REMOVE,
+                strategy = HideStrategy.ZERO_SIZE,
                 specs = listOf(TabSpec.ByDesc("视频")),
             ),
             Target(
@@ -177,9 +189,292 @@ class FuckTheVideoModule : XposedModule() {
         // specific hooks target a known tab cell class and reflect on its
         // label field directly.
         when (target.pkg) {
+            "com.taobao.taobao" -> installTBHomeTabLayoutHide(appClassLoader)
             "com.jingdong.app.mall" -> installJDNavigationGroupHide(appClassLoader)
             "com.xunmeng.pinduoduo" -> installPDDTabLayoutHide(appClassLoader)
         }
+    }
+
+    /**
+     * TB-specific: TB's main page bottom tab bar is hosted by a
+     * [TBFragmentTabHost] (com.taobao.tao.navigation.TBFragmentTabHost,
+     * classes10.dex) which extends the classic android.widget.TabHost
+     * widget. The "bottom section" tabs (首页 / 视频 / 逛逛 / 消息 /
+     * 我的 etc.) are TabSpec.TabHost tabs. The earlier
+     * [HomeDOJOTabLayout] is the TOP scrollable category bar
+     * (推荐/手机/女装/...), not the bottom section — confirmed by
+     * dumping the view tree (its bounds are [0,0][1230,129], i.e. at
+     * the very top of the screen with height 129 on a 2800-tall device).
+     *
+     * TabHost uses an internal TabWidget (a LinearLayout subclass) as
+     * the child that holds the visible tab buttons. Each tab button
+     * is a child of TabWidget and contains a TextView with the tab
+     * label (e.g. "视频").
+     *
+     * Why ZERO_SIZE (not REMOVE): the standard
+     * TabHost.onTabChanged() re-attaches fragment views, and removing
+     * a child view from the TabWidget corrupts its internal
+     * `mCurrentTab` / `mLastTab` references, causing crashes on
+     * subsequent tab switches. ZERO_SIZE preserves the view but
+     * collapses it to 0x0.
+     *
+     * attach path: hook every PUBLIC constructor of
+     * TBFragmentTabHost. After the ctor returns, post-delayed DFS
+     * scans that look for any descendant TextView with text
+     * containing "视频" and zero-size the closest ViewGroup ancestor
+     * that is a direct child of TabWidget.
+     */
+    private fun installTBHomeTabLayoutHide(classLoader: ClassLoader) {
+        val viewClass = runCatching {
+            Class.forName(
+                "com.taobao.tao.navigation.TBFragmentTabHost",
+                true,
+                classLoader,
+            )
+        }.getOrNull() ?: run {
+            log(Log.WARN, "installTBHomeTabLayoutHide: TBFragmentTabHost class not found in classLoader")
+            return
+        }
+        log(Log.INFO, "installTBHomeTabLayoutHide: found ${viewClass.name}")
+
+        var ctorHookCount = 0
+        for (ctor in viewClass.declaredConstructors) {
+            runCatching {
+                hook(ctor).intercept { chain ->
+                    chain.proceed()
+                    val view = chain.thisObject as? android.view.View ?: return@intercept null
+                    ctorHookCount++
+                    log(Log.INFO, "installTBHomeTabLayoutHide: ctor fired (#$ctorHookCount)")
+                    val handler = Handler(Looper.getMainLooper())
+                    // Multi-phase scan: cover the splash→main transition
+                    // which on TB takes 5-10s. Longest delay 12s.
+                    for (delayMs in listOf(500L, 2000L, 5000L, 8000L, 12000L)) {
+                        handler.postDelayed({ hideTBTabs(view) }, delayMs)
+                    }
+                    null
+                }
+            }.onFailure { t ->
+                log(Log.WARN, "installTBHomeTabLayoutHide: ctor hook failed", t)
+            }
+        }
+    }
+
+    /**
+     * TB bottom tab DFS. TBFragmentTabHost is a TabHost (FrameLayout),
+     * with a TabWidget (LinearLayout) as a child that holds the tab
+     * buttons. Each tab button is a FrameLayout with a TextView for
+     * the label. We DFS, find TextView with "视频", walk up to the
+     * closest FrameLayout that is a direct child of TabWidget, and
+     * ZERO_SIZE it. ZERO_SIZE (not REMOVE) is critical — REMOVE
+     * breaks TabHost's internal state machine.
+     */
+    private fun hideTBTabs(tabHost: android.view.View) {
+        if (tabHost !is android.view.ViewGroup) {
+            log(Log.WARN, "hideTBTabs: tabHost is not ViewGroup: ${tabHost.javaClass.name}")
+            return
+        }
+        val targetKeywords = listOf("视频")
+        log(Log.INFO, "hideTBTabs: enter, tabHost=${tabHost.javaClass.simpleName} childCount=${tabHost.childCount}")
+        // First scan: dump shallow tree for debugging (helps verify
+        // whether the tab cells are present at this point).
+        if (tabHost.childCount > 0) {
+            dumpShallow(tabHost, "TB.tabHost", 4)
+        }
+        // Second scan: DFS, find target TextView, ZERO_SIZE its tab-cell parent
+        val hits = zeroSizeTBVideoTabs(tabHost, targetKeywords)
+        log(Log.INFO, "hideTBTabs: scan complete, hits=$hits")
+    }
+
+    /**
+     * TB-specific DFS: walk every descendant of [root], find each
+     * TextView whose text contains any of [keywords], then walk up the
+     * parent chain looking for the tab cell — a FrameLayout that is a
+     * DIRECT child of a LinearLayout (TabWidget extends LinearLayout).
+     * ZERO_SIZE that cell.
+     */
+    private fun zeroSizeTBVideoTabs(root: android.view.ViewGroup, keywords: List<String>): Int {
+        var hits = 0
+        val stack = ArrayDeque<Pair<android.view.View, Int>>()
+        stack.addLast(root to 0)
+        while (stack.isNotEmpty()) {
+            val (v, depth) = stack.removeLast()
+            if (depth > 20) continue
+            if (v is android.widget.TextView) {
+                val text = v.text?.toString()?.trim()
+                if (text != null && keywords.any { text.contains(it) }) {
+                    val cell = findTabHostTabCell(v)
+                    if (cell != null) {
+                        // Re-hide is idempotent: zero-size + GONE are safe
+                        // to call multiple times. We don't bother with a
+                        // "processed" tag here because the cost of
+                        // re-applying the same hide is zero.
+                        log(Log.INFO, "TB: HIT TextView text=$text cell=${cell.javaClass.simpleName} bounds=[${cell.left},${cell.top}][${cell.right},${cell.bottom}] -> ZERO_SIZE")
+                        zeroOutSize(cell)
+                        hits++
+                        continue
+                    } else {
+                        log(Log.WARN, "TB: no cell found for TextView text=$text")
+                    }
+                }
+            }
+            if (v is android.view.ViewGroup) {
+                for (i in 0 until v.childCount) {
+                    runCatching { v.getChildAt(i) }.getOrNull()?.let { c ->
+                        stack.addLast(c to depth + 1)
+                    }
+                }
+            }
+        }
+        return hits
+    }
+
+    /**
+     * Find the TabHost tab cell containing [view]. The cell is the
+     * closest FrameLayout ancestor whose parent is a TabWidget
+     * (which extends LinearLayout). For TBFragmentTabHost, this is
+     * typically just the TextView's parent (since each tab cell is a
+     * small FrameLayout).
+     */
+    private fun findTabHostTabCell(view: android.view.View): android.view.View? {
+        var current: android.view.View? = view.parent as? android.view.View
+        var depth = 0
+        while (current != null && depth < 6) {
+            val parent = current.parent as? android.view.View ?: break
+            // TabWidget extends LinearLayout — check class name (TabWidget
+            // is the standard android.widget.TabWidget class, name is
+            // "android.widget.TabWidget")
+            if (parent is android.widget.LinearLayout) {
+                val pname = parent.javaClass.name
+                if (pname.contains("TabWidget") || pname.contains("tab_widget")) {
+                    return current
+                }
+            }
+            current = parent
+            depth++
+        }
+        // Fallback: if no TabWidget ancestor found, return the immediate
+        // parent FrameLayout of the TextView
+        return view.parent as? android.view.View
+    }
+
+    private fun zeroOutSize(view: android.view.View) {
+        runCatching {
+            val lp = view.layoutParams
+            if (lp != null) {
+                lp.width = 0
+                lp.height = 0
+                view.layoutParams = lp
+            } else {
+                view.layoutParams = android.view.ViewGroup.LayoutParams(0, 0)
+            }
+            view.visibility = android.view.View.GONE
+            view.requestLayout()
+        }.onFailure { t ->
+            log(Log.WARN, "zeroOutSize failed: ${t.message}", t)
+            view.visibility = android.view.View.GONE
+        }
+    }
+
+    /**
+     * Generic DFS: walk every descendant of [root] looking for a
+     * TextView whose text contains any of [keywords]. When found, walk
+     * up the parent chain to find the closest ViewGroup whose parent
+     * is the tab strip (i.e. whose parent is a LinearLayout /
+     * HorizontalScrollView with more than one TextView-descended child).
+     * GONE that cell, plus zero its LayoutParams for safety.
+     */
+    private fun findAndHideTabs(
+        root: android.view.ViewGroup,
+        keywords: List<String>,
+        tag: String,
+    ): Int {
+        var hits = 0
+        val stack = ArrayDeque<Pair<android.view.View, Int>>()
+        stack.addLast(root to 0)
+        while (stack.isNotEmpty()) {
+            val (v, depth) = stack.removeLast()
+            if (depth > 25) continue
+            if (v is android.widget.TextView) {
+                val text = v.text?.toString()?.trim()
+                if (!text.isNullOrEmpty() && keywords.any { text.contains(it) }) {
+                    val cell = findTabCell(v) ?: v
+                    log(Log.INFO, "$tag: HIT TextView text=$text class=${cell.javaClass.simpleName} -> GONE")
+                    cell.visibility = android.view.View.GONE
+                    val lp = cell.layoutParams
+                    if (lp != null) { lp.width = 0; lp.height = 0; cell.layoutParams = lp }
+                    cell.requestLayout()
+                    hits++
+                    continue  // don't recurse into a hidden cell
+                }
+            }
+            if (v is android.view.ViewGroup) {
+                for (i in 0 until v.childCount) {
+                    runCatching { v.getChildAt(i) }.getOrNull()?.let { c ->
+                        stack.addLast(c to depth + 1)
+                    }
+                }
+            }
+        }
+        return hits
+    }
+
+    /**
+     * Walk up from a matched TextView to find the visible tab cell.
+     * The cell is the closest ViewGroup that:
+     *   - is a direct child of a horizontal container (the tab strip)
+     *   - contains the matched TextView in its subtree
+     * Heuristic: climb 1-3 parents. If parent is a LinearLayout with
+     * >1 child whose subtree contains our text, that's the cell. If
+     * not, the TextView's parent is the cell.
+     */
+    private fun findTabCell(view: android.view.View): android.view.View? {
+        var current: android.view.View? = view.parent as? android.view.View
+        var depth = 0
+        while (current != null && depth < 4) {
+            val parent = current.parent as? android.view.View ?: break
+            // If the parent is a horizontal LinearLayout (i.e. the tab strip),
+            // then `current` IS the cell.
+            if (parent is android.widget.LinearLayout && parent.orientation == android.widget.LinearLayout.HORIZONTAL) {
+                return current
+            }
+            // If the parent is a HorizontalScrollView (DOJO/Material tab strip),
+            // also stop here.
+            if (parent.javaClass.name.contains("HorizontalScrollView")) {
+                return current
+            }
+            current = parent
+            depth++
+        }
+        return view.parent as? android.view.View
+    }
+
+    /**
+     * Debug helper: dump view tree to logcat with depth indentation.
+     * Used to verify that the bottom tab is the structure we expect.
+     */
+    private fun dumpShallow(root: android.view.View, tag: String, maxDepth: Int) {
+        val sb = StringBuilder()
+        sb.append("$tag dump:\n")
+        val stack = ArrayDeque<Pair<android.view.View, Int>>()
+        stack.addLast(root to 0)
+        while (stack.isNotEmpty()) {
+            val (v, d) = stack.removeLast()
+            if (d > maxDepth) continue
+            val indent = "  ".repeat(d)
+            val cls = v.javaClass.simpleName
+            val id = runCatching { v.resources.getResourceEntryName(v.id) }.getOrNull() ?: ""
+            val text = (v as? android.widget.TextView)?.text?.toString()?.take(20) ?: ""
+            val desc = v.contentDescription?.toString()?.take(20) ?: ""
+            sb.appendLine("$indent- $cls id=$id text=$text desc=$desc bounds=[${v.left},${v.top}][${v.right},${v.bottom}]")
+            if (v is android.view.ViewGroup) {
+                for (i in 0 until v.childCount) {
+                    runCatching { v.getChildAt(i) }.getOrNull()?.let { c ->
+                        stack.addLast(c to d + 1)
+                    }
+                }
+            }
+        }
+        log(Log.INFO, sb.toString())
     }
 
     /**
